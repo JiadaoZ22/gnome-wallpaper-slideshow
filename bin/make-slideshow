@@ -28,7 +28,14 @@ DEFAULTS = {
     "STATE_DIR": "~/.local/state/gnome-wallpaper-slideshow",
     "MANIFEST": "~/.local/state/gnome-wallpaper-slideshow/upscale-manifest.json",
     "DURATION": "15.0",          # seconds each image stays up
-    "TRANSITION": "2.0",         # seconds of cross-fade
+    # Cross-fade seconds. Each mutter background is a solid black layer plus the
+    # image texture; in contain ('scaled') mode the letterbox shows that black.
+    # A long overlay dissolve spends most of its time with the NEW actor semi-
+    # transparent, so its black regions read as a fade-to-black / late new image.
+    # Keep it short (~0.5-0.8s) so it looks like a quick smooth dissolve. 0 gives
+    # an instant hard cut. GNOME 42's parser has no transition <type>, so this
+    # duration is the only lever.
+    "TRANSITION": "0.6",         # seconds of cross-fade
     # 'scaled' = contain fit: whole image visible, aspect preserved, black bars
     # for any unfilled area; never crops (unlike 'zoom').
     "PICTURE_OPTIONS": "scaled",  # scaled | zoom | centered | stretched | none

@@ -8,8 +8,11 @@
 GALLERY_DIR=/home/you/Documents/1_Gallery/b_Processed
 
 # How long each image stays, and the cross-fade duration, in seconds.
+# Keep TRANSITION short (~0.5-0.8): mutter's contain-fit background carries a
+# black letterbox layer, so a long dissolve reads as a fade-to-black with the
+# new image appearing late. 0.6 = quick smooth dissolve; 0 = instant hard cut.
 DURATION=15.0
-TRANSITION=2.0
+TRANSITION=0.6
 
 # GNOME picture placement. 'scaled' = contain fit: the whole image is visible,
 # its aspect ratio is preserved (never stretched), and any unfilled area gets

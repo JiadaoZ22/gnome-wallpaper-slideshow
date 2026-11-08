@@ -40,6 +40,30 @@ don't auto-refresh a folder as cleanly.
   even ×4 does not reach the screen, it is centered at its true SR size on a
   black 4K canvas instead of being enlarged further.
 
+## Crossfade tuning (avoid the fade-to-black)
+
+GNOME 42's slideshow parser supports exactly one transition — an `overlay`
+crossfade — and exposes **no `<type>` element** (adding one can fail the whole
+parse and black out the background); its only knob is `<duration>`. Each mutter
+background is composited as a solid `primary-color` layer (black here) with the
+image texture on top; in contain fit the letterbox reveals that black. During a
+crossfade the *new* background actor ramps opacity over the old one, so with a
+**long** duration its black regions (and a texture still decoding) dominate for
+most of the fade — it reads as "fades out to dark, then the new image appears".
+
+Keep `TRANSITION` short so it is a quick, smooth dissolve rather than a
+fade-through-black:
+
+- `0.6` (default) — quick smooth dissolve; good for 15 s rotation.
+- `0.3–0.5` — snappier; use if any dark dip is still noticeable.
+- `0` — instant hard cut, no blending at all.
+- Avoid `≥1.5` on contain-fit/letterboxed wallpapers: that is where the
+  fade-to-black effect returns. (Stock GNOME only uses 5 s fades because each
+  image holds for ~30 min and they are full-bleed, not letterboxed.)
+
+Change it in `~/.config/gnome-wallpaper-slideshow/config` then
+`systemctl --user start wallpaper-slideshow.service`.
+
 ## What it does
 
 - Recursively includes `jpg jpeg png webp bmp gif`; skips hidden files and
