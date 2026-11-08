@@ -1,0 +1,4 @@
+# Local deployment artifacts (the repo only tracks sources)
+*.pyc
+__pycache__/
+.DS_Store

@@ -1,0 +1,15 @@
+[Unit]
+Description=Daily regeneration of the GNOME wallpaper slideshow (backstop)
+
+[Timer]
+# Regenerate once a day (03:17) and shortly after boot/login, so newly added
+# images are picked up even if the path unit's non-recursive watch missed them.
+# The 20 s debounce never blocks these: they run hours after the previous build,
+# long outside the debounce window, so a scheduled rebuild always proceeds.
+OnCalendar=*-*-* 03:17:00
+OnBootSec=15min
+Persistent=true
+Unit=wallpaper-slideshow.service
+
+[Install]
+WantedBy=timers.target

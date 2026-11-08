@@ -1,0 +1,16 @@
+[Unit]
+Description=Watch gallery folder and regenerate the GNOME wallpaper slideshow on change
+After=graphical-session.target
+
+[Path]
+# inotify watch (kernel-level, essentially free; no polling daemon).
+# Non-recursive: watches the gallery dir itself. The daily timer is the
+# backstop for changes made only inside nested subdirectories.
+# Default gallery; install.sh rewrites this line if GALLERY_DIR is customized.
+PathModified=%h/Documents/1_Gallery/b_Processed
+Unit=wallpaper-slideshow.service
+# Do not throttle burst triggers; the oneshot service coalesces via flock.
+TriggerLimitIntervalSec=0
+
+[Install]
+WantedBy=graphical-session.target

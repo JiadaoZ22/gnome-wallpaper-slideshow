@@ -1,0 +1,226 @@
+#!/usr/bin/env python3
+"""Generate a GNOME desktop-background slideshow XML from a folder of images.
+
+This is a ONESHOT tool, not a daemon: GNOME Shell itself performs the timed
+rotation from the generated slideshow XML. A systemd path unit / timer calls
+this script when the gallery changes or on a schedule; it finishes in
+milliseconds and exits, so there is no resident process and ~zero CPU/RAM.
+
+Stdlib only (Python 3.8+). Safe against spaces and XML-special characters in
+paths; writes atomically and never leaves a half-written XML behind.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import fcntl
+import os
+import random
+import subprocess
+import sys
+import xml.sax.saxutils as sx
+from pathlib import Path
+from urllib.parse import quote
+
+DEFAULTS = {
+    "GALLERY_DIR": "~/Documents/1_Gallery/b_Processed",
+    "OUTPUT_DIR": "~/.local/share/backgrounds/gnome-wallpaper-slideshow",
+    "STATE_DIR": "~/.local/state/gnome-wallpaper-slideshow",
+    "DURATION": "599.0",        # seconds each image stays up
+    "TRANSITION": "1.5",        # seconds of cross-fade
+    "PICTURE_OPTIONS": "zoom",  # zoom | centered | scaled | stretched | wallpaper | none
+    "RANDOM": "1",              # 1 = shuffle every regeneration, 0 = sorted
+    "KEEP": "5",                # number of old versioned XMLs to retain
+    "DEBOUNCE": "20",           # skip if a run happened within N seconds (0 disables)
+    "EXTENSIONS": "jpg,jpeg,png,webp,bmp,gif",
+}
+# Partial / temporary downloads and other non-wallpaper files are skipped even
+# if their temporary extension ends in an image-like suffix.
+EXCLUDE_SUFFIXES = (
+    ".aliyunpan-downloading",
+    ".part",
+    ".tmp",
+    ".download",
+    ".crdownload",
+    "~",
+)
+
+
+def env(key: str) -> str:
+    val = os.environ.get(key)
+    return val if val not in (None, "") else os.path.expanduser(DEFAULTS[key])
+
+
+def log(state_dir: Path, msg: str) -> None:
+    state_dir.mkdir(parents=True, exist_ok=True)
+    line = f"{dt.datetime.now().isoformat(timespec='seconds')} {msg}\n"
+    with (state_dir / "run.log").open("a", encoding="utf-8") as fh:
+        fh.write(line)
+    print(line, end="")
+
+
+def collect_images(gallery: Path, extensions: set[str]) -> list[Path]:
+    images: list[Path] = []
+    for root, _dirs, files in os.walk(gallery):
+        for name in files:
+            if name.startswith("."):
+                continue
+            lower = name.lower()
+            if lower.endswith(EXCLUDE_SUFFIXES):
+                continue
+            if lower.rsplit(".", 1)[-1] not in extensions:
+                continue
+            images.append(Path(root) / name)
+    return sorted(images)
+
+
+def file_uri(path: Path) -> str:
+    # quote() percent-encodes spaces/non-ASCII but keeps "/"; absolute path
+    # then gets the standard three-slash file URI (no doubled slashes).
+    # Escape XML specials on top.
+    return sx.escape("file://" + quote(str(path)))
+
+
+def build_xml(images: list[Path], duration: float, transition: float) -> str:
+    start = dt.datetime.now()
+    parts = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        "<background>",
+        "  <starttime>",
+        f"    <year>{start.year}</year>",
+        f"    <month>{start.month}</month>",
+        f"    <day>{start.day}</day>",
+        f"    <hour>{start.hour}</hour>",
+        f"    <minute>{start.minute}</minute>",
+        f"    <second>{start.second}</second>",
+        "  </starttime>",
+    ]
+    count = len(images)
+    for i, img in enumerate(images):
+        nxt = images[(i + 1) % count]
+        parts += [
+            "  <static>",
+            f"    <duration>{duration:.1f}</duration>",
+            f"    <file>{file_uri(img)}</file>",
+            "  </static>",
+            "  <transition>",
+            f"    <duration>{transition:.1f}</duration>",
+            f"    <from>{file_uri(img)}</from>",
+            f"    <to>{file_uri(nxt)}</to>",
+            "  </transition>",
+        ]
+    parts.append("</background>")
+    return "\n".join(parts) + "\n"
+
+
+def gsettings_set(key: str, value: str, state_dir: Path) -> bool:
+    if not os.environ.get("DBUS_SESSION_BUS_ADDRESS"):
+        log(state_dir, f"WARN DBUS_SESSION_BUS_ADDRESS unset; wrote XML but could not set {key} "
+                       "(will apply on next graphical-session run)")
+        return False
+    try:
+        subprocess.run(["gsettings", "set", "org.gnome.desktop.background", key, value],
+                       check=True, capture_output=True, text=True, timeout=20)
+        return True
+    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        detail = getattr(exc, "stderr", str(exc))
+        log(state_dir, f"WARN gsettings {key} failed: {str(detail).strip()}")
+        return False
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Generate and apply a GNOME wallpaper slideshow.")
+    ap.add_argument("--no-apply", action="store_true",
+                    help="write the XML but do not modify gsettings (dry-run of the desktop)")
+    ap.add_argument("--force", action="store_true",
+                    help="run even if within the DEBOUNCE quiet interval")
+    ap.add_argument("--verbose", action="store_true")
+    args = ap.parse_args()
+
+    gallery = Path(os.path.expanduser(env("GALLERY_DIR")))
+    output_dir = Path(os.path.expanduser(env("OUTPUT_DIR")))
+    state_dir = Path(os.path.expanduser(env("STATE_DIR")))
+    output_dir.mkdir(parents=True, exist_ok=True)
+    state_dir.mkdir(parents=True, exist_ok=True)
+
+    # Serialize concurrent triggers (bulk downloads fire many inotify events).
+    lock_fh = (state_dir / "run.lock").open("w")
+    try:
+        fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        log(state_dir, "SKIP another regeneration is already running")
+        return 0
+
+    # Debounce: systemd queues one service run per inotify event and executes
+    # them back-to-back, so flock alone won't coalesce a burst. If the latest
+    # XML is younger than DEBOUNCE seconds, skip; the daily timer backstop and
+    # the next event outside the window ensure no real change is lost.
+    debounce = float(env("DEBOUNCE"))
+    if debounce > 0 and not args.force:
+        newest = sorted(output_dir.glob("slideshow-*.xml"),
+                        key=lambda p: p.stat().st_mtime, reverse=True)
+        if newest and (dt.datetime.now().timestamp() - newest[0].stat().st_mtime) < debounce:
+            log(state_dir, f"DEBOUNCE latest XML is <{debounce:.0f}s old; skipping "
+                           "(use --force to override)")
+            return 0
+
+    if not gallery.is_dir():
+        log(state_dir, f"ERROR gallery directory not found: {gallery}")
+        return 0  # oneshot: do not enter a failed-restart loop
+
+    extensions = {e.strip().lower() for e in env("EXTENSIONS").split(",") if e.strip()}
+    images = collect_images(gallery, extensions)
+    if not images:
+        log(state_dir, f"WARN no usable images under {gallery}; keeping current wallpaper")
+        return 0
+
+    if env("RANDOM") == "1":
+        random.shuffle(images)
+
+    duration = float(env("DURATION"))
+    transition = float(env("TRANSITION"))
+    xml_text = build_xml(images, duration, transition)
+
+    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    final = output_dir / f"slideshow-{stamp}.xml"
+    tmp = output_dir / f".slideshow-{stamp}.xml.tmp"
+    tmp.write_text(xml_text, encoding="utf-8")
+    os.replace(tmp, final)  # atomic publish
+
+    # Stable symlink for humans / Settings; gsettings still points at the
+    # versioned file so GNOME reliably reloads on every regeneration.
+    link = output_dir / "current.xml"
+    tmp_link = output_dir / ".current.xml.tmp"
+    if tmp_link.exists() or tmp_link.is_symlink():
+        tmp_link.unlink()
+    os.symlink(final.name, tmp_link)
+    os.replace(tmp_link, link)
+
+    # Prune old versioned XMLs, keeping the newest KEEP plus the live target.
+    keep = max(1, int(env("KEEP")))
+    xmls = sorted(output_dir.glob("slideshow-*.xml"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for old in xmls[keep:]:
+        if old.resolve() != link.resolve():
+            old.unlink(missing_ok=True)
+
+    applied = "skipped"  # --no-apply
+    if not args.no_apply:
+        uri = f"file://{final}"
+        ok = True
+        for key in ("picture-uri", "picture-uri-dark"):
+            ok = gsettings_set(key, uri, state_dir) and ok
+        ok = gsettings_set("picture-options", env("PICTURE_OPTIONS"), state_dir) and ok
+        applied = "yes" if ok else "xml-only"
+
+    log(state_dir, f"OK images={len(images)} duration={duration:.0f}s transition={transition:.1f}s "
+                   f"applied={applied} -> {final.name}")
+    if args.verbose:
+        print(f"gallery : {gallery}")
+        print(f"images  : {len(images)}")
+        print(f"xml     : {final}")
+        print(f"symlink : {link} -> {final.name}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

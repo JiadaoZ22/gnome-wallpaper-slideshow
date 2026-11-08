@@ -1,0 +1,29 @@
+# gnome-wallpaper-slideshow user configuration
+# Installed to ~/.config/gnome-wallpaper-slideshow/config and read by the
+# systemd service (EnvironmentFile). Plain KEY=value, no `export`.
+# Re-run `systemctl --user start wallpaper-slideshow.service` after editing.
+
+# Folder scanned for images (recursive). Temporary/partial downloads and
+# non-image files are skipped automatically.
+GALLERY_DIR=/home/you/Documents/1_Gallery/b_Processed
+
+# How long each image stays, and the cross-fade duration, in seconds.
+DURATION=599.0
+TRANSITION=1.5
+
+# GNOME picture placement: zoom | centered | scaled | stretched | wallpaper | none
+PICTURE_OPTIONS=zoom
+
+# 1 = reshuffle order on every regeneration; 0 = deterministic sorted order
+RANDOM=1
+
+# Comma-separated image extensions to include (lower-case, no dots).
+EXTENSIONS=jpg,jpeg,png,webp,bmp,gif
+
+# Number of historical versioned XML files kept alongside the live one.
+KEEP=5
+
+# Coalesce inotify bursts: skip a regeneration if the newest XML is younger
+# than this many seconds (the daily timer still forces a rebuild). Set 0 to
+# disable. Override a single run with: make-slideshow --force
+DEBOUNCE=20
