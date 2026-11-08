@@ -1,0 +1,9 @@
+{
+  "uuid": "gnome-wallpaper-ease@jiadaoz22.github.com",
+  "name": "Wallpaper Ease Slideshow",
+  "description": "GPU-composited, iOS-style ease-in-out wallpaper crossfade at full frame rate. Drives the desktop background from a JSON playlist produced by the gnome-wallpaper-slideshow generator, using two Meta.Background actors and Clutter EASE_IN_OUT_CUBIC. Replaces GNOME 42's native 1 Hz linear slideshow transition; the native slideshow still backs the lock screen and is the fallback when this extension is disabled.",
+  "shell-version": ["42", "42.9"],
+  "version": 1,
+  "version-name": "1.0.0",
+  "url": "https://github.com/JiadaoZ22/gnome-wallpaper-slideshow"
+}

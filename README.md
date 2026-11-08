@@ -40,29 +40,70 @@ don't auto-refresh a folder as cleanly.
   even ×4 does not reach the screen, it is centered at its true SR size on a
   black 4K canvas instead of being enlarged further.
 
-## Crossfade tuning (avoid the fade-to-black)
+## Smooth iOS-style crossfade (the Wallpaper Ease extension)
 
-GNOME 42's slideshow parser supports exactly one transition — an `overlay`
-crossfade — and exposes **no `<type>` element** (adding one can fail the whole
-parse and black out the background); its only knob is `<duration>`. Each mutter
-background is composited as a solid `primary-color` layer (black here) with the
-image texture on top; in contain fit the letterbox reveals that black. During a
-crossfade the *new* background actor ramps opacity over the old one, so with a
-**long** duration its black regions (and a texture still decoding) dominate for
-most of the fade — it reads as "fades out to dark, then the new image appears".
+GNOME 42's **native** slideshow crossfade cannot do an iOS-style nonlinear
+transition — verified against the shell source on this machine:
 
-Keep `TRANSITION` short so it is a quick, smooth dissolve rather than a
-fade-through-black:
+- `ui/background.js` drives the XML slideshow with a **linear** opacity blend
+  redrawn at most **once per second** (`ANIMATION_MIN_WAKEUP_INTERVAL = 1.0`).
+- The slideshow parser (`libgnome-desktop-3`) has no transition `<type>` or
+  easing/curve element — `<duration>` is the only knob. A 2.5 s native fade
+  therefore steps through ~2–3 visible jumps and, on contain-fit images with
+  black letterbox, reads as a fade-through-dark.
 
-- `0.6` (default) — quick smooth dissolve; good for 15 s rotation.
-- `0.3–0.5` — snappier; use if any dark dip is still noticeable.
-- `0` — instant hard cut, no blending at all.
-- Avoid `≥1.5` on contain-fit/letterboxed wallpapers: that is where the
-  fade-to-black effect returns. (Stock GNOME only uses 5 s fades because each
-  image holds for ~30 min and they are full-bleed, not letterboxed.)
+This repo ships a small **in-process GNOME Shell extension**
+(`extension/gnome-wallpaper-ease@…`) that takes over the *desktop* background
+and renders the swap at the shell's full frame rate:
 
-Change it in `~/.config/gnome-wallpaper-slideshow/config` then
-`systemctl --user start wallpaper-slideshow.service`.
+- two `Meta.Background` actors (contain-fit, identical black-letterbox rendering
+  to the native shell) crossfaded with
+  `Clutter.AnimationMode.EASE_IN_OUT_CUBIC` — the iOS-style S-curve: slow start,
+  fast mid-swap, slow settle;
+- the **new image is fully decoded before the fade starts** and the old actor
+  stays fully opaque underneath, so the screen is never under-filled (no black
+  dip, no missing-image flash);
+- reads a JSON `playlist.json` + `extension-config.json` written by
+  `make-slideshow` and hot-reloads them via `GFileMonitor` — change
+  `DURATION`/`TRANSITION`, regenerate, and the new timing applies **without a
+  shell reload**;
+- idle cost is one `GLib.timeout` inside the shell process — no extra daemon;
+- it only **hides** the native desktop background while active and restores it
+  on disable; gsettings are never modified, so the **lock screen keeps using
+  the native XML slideshow** and everything keeps working if the extension is
+  absent, disabled, or errors out (defensive try/catch retains the native bg).
+
+### Install / enable the extension
+
+`./install.sh` runs `scripts/install-extension.sh`, which **copies** the
+extension into `~/.local/share/gnome-shell/extensions/` (a copy, not a symlink —
+the loader does not reliably follow symlinks onto FUSE/NTFS), flips
+`disable-user-extensions=false`, and adds the UUID to `enabled-extensions`.
+
+A brand-new extension is only scanned at shell startup, and GNOME 42 provides
+no live rescan over D-Bus (`ReloadExtension` is unimplemented; `Eval` is
+locked). So after the first install, reload the shell **once**:
+
+- **X11:** `Alt+F2` → type `r` → Enter (windows stay open; ~1–2 s blink).
+- **Wayland:** log out and back in.
+
+Then verify:
+
+```bash
+gnome-extensions info gnome-wallpaper-ease@jiadaoz22.github.com
+./scripts/healthcheck.sh
+journalctl --user -b | grep wallpaper-ease
+```
+
+Editing `extension.js` requires re-running `scripts/install-extension.sh` and
+reloading the shell; editing only timing/playlist does not (the extension
+monitors its JSON inputs).
+
+### Numeric knobs
+
+`DURATION` = image hold (s), `TRANSITION` = fade length (s). Defaults:
+**17.5 s hold / 2.5 s crossfade.** The same values feed the extension
+(`interval_ms`/`fade_ms`) and the native XML used by the lock screen.
 
 ## What it does
 
@@ -175,6 +216,9 @@ a couple of seconds (the service adds a 2 s settle delay to merge bursts).
 ## Uninstall
 
 ```bash
+# Remove the shell extension first (restores the native desktop background):
+gnome-extensions disable gnome-wallpaper-ease@jiadaoz22.github.com
+rm -rf ~/.local/share/gnome-shell/extensions/gnome-wallpaper-ease@jiadaoz22.github.com
 ./uninstall.sh           # remove units, restore a static wallpaper
 ./uninstall.sh --purge   # also delete config, generator, logs and generated XML
 ```
@@ -182,9 +226,15 @@ a couple of seconds (the service adds a 2 s settle delay to merge bursts).
 ## Layout
 
 ```
-bin/make-slideshow            oneshot slideshow generator (Python stdlib)
+bin/make-slideshow            oneshot slideshow + playlist/config generator
 bin/upscale-wallpapers        batch Real-ESRGAN + letterbox (Pillow + ncnn)
 bin/prune-lowres              move sub-MIN_DIMENSION images to a quarantine
+extension/<uuid>/             GNOME Shell extension: 60fps EASE_IN_OUT_CUBIC fade
+  extension.js                  two Meta.Background actors, JSON playlist driven
+  metadata.json / stylesheet.css
+scripts/
+  install-extension.sh        copy + enable the extension (idempotent)
+  healthcheck.sh              read-only end-to-end verification
 config/config.example         user config template
 systemd/
   wallpaper-slideshow.service oneshot regeneration job

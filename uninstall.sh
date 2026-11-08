@@ -10,6 +10,24 @@ systemctl --user disable --now wallpaper-upscale.timer    2>/dev/null || true
 systemctl --user stop wallpaper-slideshow.service         2>/dev/null || true
 systemctl --user stop wallpaper-upscale.service           2>/dev/null || true
 
+echo "==> Disabling and removing the Wallpaper Ease shell extension"
+UUID="gnome-wallpaper-ease@jiadaoz22.github.com"
+if command -v gnome-extensions >/dev/null 2>&1; then
+  gnome-extensions disable "$UUID" 2>/dev/null || true
+fi
+# Drop the UUID from the enabled-extensions dconf array (idempotent).
+python3 - "$UUID" <<'PY'
+import subprocess, sys
+uuid = sys.argv[1]
+raw = subprocess.run(["gsettings", "get", "org.gnome.shell", "enabled-extensions"],
+                     capture_output=True, text=True).stdout.strip()
+vals = [v.strip().strip("'") for v in raw.strip("[]").split(",") if v.strip()] if raw not in ("@as []", "[]", "") else []
+vals = [v for v in vals if v != uuid]
+arr = "[" + ", ".join("'%s'" % v for v in vals) + "]"
+subprocess.run(["gsettings", "set", "org.gnome.shell", "enabled-extensions", arr], check=False)
+PY
+rm -rf "$HOME/.local/share/gnome-shell/extensions/$UUID"
+
 UNIT_DIR="$HOME/.config/systemd/user"
 echo "==> Removing unit files"
 rm -f "$UNIT_DIR/wallpaper-slideshow.service" \

@@ -1,0 +1,3 @@
+/* No custom theme needed: all rendering uses native Meta.Background actors.
+   This file exists so the extension directory conforms to the GNOME Shell
+   extension layout (metadata.json + extension.js + stylesheet.css). */

@@ -76,6 +76,14 @@ systemctl --user start wallpaper-slideshow.service || true
 echo "==> Starting Real-ESRGAN batch in the background (GPU 0)"
 systemctl --user start --no-block wallpaper-upscale.service || true
 
+# Install the in-process shell extension that renders the smooth 60fps
+# ease-in-out crossfade on the desktop. Copied (not symlinked) because the
+# shell loader does not follow symlinks onto FUSE/NTFS mounts.
+if [ -d "$SRC/extension" ]; then
+  echo "==> Installing Wallpaper Ease shell extension"
+  "$SRC/scripts/install-extension.sh" || echo "    WARN extension install step failed; native slideshow remains active"
+fi
+
 # Linger makes user services start at boot and survive logout (no-op if already on).
 if loginctl show-user "$USER" -p Linger 2>/dev/null | grep -q '=no'; then
   echo "==> Enabling linger (may prompt for sudo)"

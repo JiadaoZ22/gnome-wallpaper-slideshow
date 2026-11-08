@@ -7,12 +7,15 @@
 # non-image files are skipped automatically.
 GALLERY_DIR=/home/you/Documents/1_Gallery/b_Processed
 
-# How long each image stays, and the cross-fade duration, in seconds.
-# Keep TRANSITION short (~0.5-0.8): mutter's contain-fit background carries a
-# black letterbox layer, so a long dissolve reads as a fade-to-black with the
-# new image appearing late. 0.6 = quick smooth dissolve; 0 = instant hard cut.
-DURATION=15.0
-TRANSITION=0.6
+# How long each image stays, and the cross-fade length, in seconds.
+# Desktop: the Wallpaper Ease shell extension uses these to drive a 60fps
+#   EASE_IN_OUT_CUBIC (iOS-style S-curve) crossfade — see README. It reads the
+#   generated extension-config.json (interval_ms/fade_ms), so changes here take
+#   effect on the next slideshow regeneration, no shell reload needed.
+# Lock screen / fallback: the native GNOME XML slideshow uses the same values,
+#   but its crossfade is a 1 Hz linear blend with no easing.
+DURATION=17.5
+TRANSITION=2.5
 
 # GNOME picture placement. 'scaled' = contain fit: the whole image is visible,
 # its aspect ratio is preserved (never stretched), and any unfilled area gets

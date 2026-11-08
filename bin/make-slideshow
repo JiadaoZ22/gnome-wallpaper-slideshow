@@ -27,15 +27,15 @@ DEFAULTS = {
     "OUTPUT_DIR": "~/.local/share/backgrounds/gnome-wallpaper-slideshow",
     "STATE_DIR": "~/.local/state/gnome-wallpaper-slideshow",
     "MANIFEST": "~/.local/state/gnome-wallpaper-slideshow/upscale-manifest.json",
-    "DURATION": "15.0",          # seconds each image stays up
-    # Cross-fade seconds. Each mutter background is a solid black layer plus the
-    # image texture; in contain ('scaled') mode the letterbox shows that black.
-    # A long overlay dissolve spends most of its time with the NEW actor semi-
-    # transparent, so its black regions read as a fade-to-black / late new image.
-    # Keep it short (~0.5-0.8s) so it looks like a quick smooth dissolve. 0 gives
-    # an instant hard cut. GNOME 42's parser has no transition <type>, so this
-    # duration is the only lever.
-    "TRANSITION": "0.6",         # seconds of cross-fade
+    "DURATION": "17.5",          # seconds each image stays up
+    # Cross-fade seconds. NOTE on GNOME 42 the native slideshow (BGSlideShow)
+    # crossfade is a LINEAR opacity blend redrawn at most once per second
+    # (ANIMATION_MIN_WAKEUP_INTERVAL=1.0 in background.js), with no easing knob:
+    # the XML has no transition <type>/curve. A multi-second value therefore
+    # looks stepped and, in contain ('scaled') mode with black letterbox, can
+    # read as a fade-through-dark. For a smooth iOS-style ease-in-out at full
+    # refresh rate, the companion shell extension performs the swap instead.
+    "TRANSITION": "2.5",         # seconds of cross-fade
     # 'scaled' = contain fit: whole image visible, aspect preserved, black bars
     # for any unfilled area; never crops (unlike 'zoom').
     "PICTURE_OPTIONS": "scaled",  # scaled | zoom | centered | stretched | none
@@ -125,6 +125,42 @@ def build_xml(images: list[Path], duration: float, transition: float) -> str:
         ]
     parts.append("</background>")
     return "\n".join(parts) + "\n"
+
+
+def _atomic_write_json(path: Path, payload: dict) -> None:
+    """Write JSON via tmp + rename so the shell extension's GFile monitor never
+    observes a half-written file (it acts only on CHANGES_DONE_HINT/CREATED)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def write_extension_artifacts(output_dir: Path, state_dir: Path,
+                              images: list[Path], duration: float,
+                              transition: float) -> tuple[Path, Path]:
+    """Emit the JSON playlist + config consumed by the Wallpaper Ease shell
+    extension. The extension renders the smooth 60fps ease-in-out crossfade;
+    the XML slideshow still backs the lock screen and the no-extension case.
+    Returns (playlist_path, config_path)."""
+    playlist_path = output_dir / "playlist.json"
+    config_path = state_dir / "extension-config.json"
+    _atomic_write_json(playlist_path, {
+        "version": 1,
+        "updated": dt.datetime.now().isoformat(timespec="seconds"),
+        "count": len(images),
+        # Absolute paths; the extension filters any that vanish before load.
+        "images": [str(p) for p in images],
+    })
+    _atomic_write_json(config_path, {
+        "version": 1,
+        "playlist_path": str(playlist_path),
+        "interval_ms": int(round(duration * 1000)),
+        "fade_ms": int(round(transition * 1000)),
+        "style": "scaled",
+        "easing": "EASE_IN_OUT_CUBIC",
+    })
+    return playlist_path, config_path
 
 
 def gsettings_set(schema: str, key: str, value: str, state_dir: Path) -> bool:
@@ -255,6 +291,12 @@ def main() -> int:
         if old.resolve() != link.resolve():
             old.unlink(missing_ok=True)
 
+    # Emit the JSON playlist + config for the Wallpaper Ease shell extension
+    # (smooth 60fps ease-in-out). The XML above remains the lock-screen source
+    # and the fallback when the extension is absent/disabled.
+    playlist_path, ext_cfg_path = write_extension_artifacts(
+        output_dir, state_dir, images, duration, transition)
+
     applied = "skipped"  # --no-apply
     if not args.no_apply:
         uri = f"file://{final}"
@@ -271,13 +313,15 @@ def main() -> int:
         applied = "yes" if ok else "xml-only"
 
     log(state_dir, f"OK images={len(images)} sr_substituted={substituted} "
-                   f"duration={duration:.0f}s transition={transition:.1f}s style={env('PICTURE_OPTIONS')} "
+                   f"duration={duration:.1f}s transition={transition:.1f}s style={env('PICTURE_OPTIONS')} "
                    f"lockscreen={'on' if env('SET_LOCKSCREEN') == '1' else 'off'} "
-                   f"applied={applied} -> {final.name}")
+                   f"applied={applied} -> {final.name}; playlist={playlist_path.name}")
     if args.verbose:
         print(f"gallery     : {gallery}")
         print(f"images      : {len(images)} (SR/letterbox substituted: {substituted})")
         print(f"xml         : {final}")
+        print(f"playlist    : {playlist_path} ({len(images)} entries)")
+        print(f"ext config  : {ext_cfg_path}")
         print(f"symlink     : {link} -> {final.name}")
         print(f"lock screen : {'on' if env('SET_LOCKSCREEN') == '1' else 'off'}")
     return 0
