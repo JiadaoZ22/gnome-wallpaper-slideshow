@@ -30,6 +30,10 @@ folder as cleanly.
   partial downloads (`.aliyunpan-downloading`, `.part`, `.tmp`, `.crdownload`, …).
 - Handles spaces / non-ASCII paths (percent-encoded URIs, XML-escaped).
 - Shuffles order on each regeneration (or sorted mode via `RANDOM=0`).
+- Coalesces bulk-download bursts: an inotify debounce (`DEBOUNCE=20`s) plus a
+  `flock` means hundreds of simultaneous file events produce a single
+  regeneration; `make-slideshow --force` bypasses it, and the daily timer runs
+  far outside the window so scheduled builds always proceed.
 - Writes `~/.local/share/backgrounds/gnome-wallpaper-slideshow/slideshow-<ts>.xml`
   atomically, keeps a `current.xml` symlink, and prunes old versions.
 - Sets both `picture-uri` and `picture-uri-dark`, plus `picture-options`.
@@ -55,7 +59,8 @@ systemctl --user start wallpaper-slideshow.service
 ```
 
 `config` keys: `GALLERY_DIR`, `DURATION` (seconds per image), `TRANSITION`
-(cross-fade seconds), `PICTURE_OPTIONS`, `RANDOM` (1/0), `EXTENSIONS`, `KEEP`.
+(cross-fade seconds), `PICTURE_OPTIONS`, `RANDOM` (1/0), `EXTENSIONS`, `KEEP`,
+`DEBOUNCE` (inotify quiet window in seconds, 0 to disable).
 
 ## Verify
 
