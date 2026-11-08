@@ -115,6 +115,11 @@ var WallpaperEase = class WallpaperEase {
         this._group = Main.layoutManager._backgroundGroup;
         this._actors = [];            // at most 2 of our actors
         this._nativeActors = [];      // shell's own background actors we hide
+        this._overviewActors = new Set(); // overview bg actors we have retargeted
+        this._overviewSignals = [];      // 'showing'/'shown' connections
+        this._switchActors = new Set();  // workspace-switch animation bg actors
+        this._switchSignal = 0;          // ShellWM 'switch-workspace' connection
+        this._switchIdle = 0;            // deferred (idle) retarget id
         this._timeouts = new Set();
         this._fileMonitor = null;
         this._monitorSignal = 0;
@@ -152,6 +157,8 @@ var WallpaperEase = class WallpaperEase {
         }
         this._reloadPlaylist();
         this._watchPlaylist();
+        this._watchOverview();
+        this._watchWorkspaceSwitch();
 
         if (this._playlist.length === 0) {
             log('wallpaper-ease: empty playlist; native background retained');
@@ -169,6 +176,10 @@ var WallpaperEase = class WallpaperEase {
     disable() {
         this._running = false;
         this._clearTimeouts();
+        this._unwatchOverview();
+        this._restoreOverview();
+        this._unwatchWorkspaceSwitch();
+        this._restoreTracked(this._switchActors, 'switch');
         if (this._monitorSignal && this._fileMonitor) {
             this._fileMonitor.disconnect(this._monitorSignal);
             this._monitorSignal = 0;
@@ -219,6 +230,199 @@ var WallpaperEase = class WallpaperEase {
         }
         this._nativeActors = [];
         this._nativeHidden = false;
+    }
+
+    // ---- Activities overview background sync ----
+    // The overview's per-workspace WorkspaceBackground (ui/workspace.js) builds
+    // its OWN BackgroundManager off gsettings in a separate Meta.BackgroundGroup,
+    // so without intervention it shows the native (1 Hz) slideshow and drifts to
+    // a different image than our eased desktop. We retarget each overview
+    // BackgroundActor's content to our current Meta.Background so both surfaces
+    // show the identical image.
+    //
+    // Timing is the subtle part:
+    //   * 'hiding' fires at the START of the close animation, while the overview
+    //     is still on screen. Restoring the native bg there makes the foreign
+    //     image flash through the whole zoom-out. So we never restore on hide.
+    //   * Workspace background actors are destroyed when the overview closes
+    //     (workspacesView destroys Workspace -> WorkspaceBackground._onDestroy ->
+    //     _bgManager.destroy()). We just prune them on their own 'destroy' and
+    //     retarget fresh actors the next time 'showing' builds them.
+    //   * The only explicit restore is at disable(); by then actors are usually
+    //     already destroyed, and every access is wrapped defensively.
+    _watchOverview() {
+        try {
+            const ov = Main.overview;
+            this._overviewSignals.push(ov.connect('showing',
+                () => this._syncOverview()));
+            // Re-sync on the fully-open state too: 'showing' can run a frame
+            // before the lazily-built WorkspaceBackground actors exist.
+            this._overviewSignals.push(ov.connect('shown',
+                () => this._syncOverview()));
+        } catch (e) {
+            logError(e, 'wallpaper-ease: overview watch unavailable');
+        }
+    }
+
+    _unwatchOverview() {
+        const ov = Main.overview;
+        for (const id of this._overviewSignals) {
+            try {
+                ov.disconnect(id);
+            } catch (_e) { /* already gone */ }
+        }
+        this._overviewSignals = [];
+    }
+
+    // Depth-first collection of every Meta.BackgroundActor under a root.
+    // Match by GType name rather than `instanceof` so cross-realm/gtype-wrapper
+    // differences can never make us miss (or misclassify) an actor.
+    _collectBackgroundActors(root, out) {
+        if (!root)
+            return;
+        if (root.constructor && root.constructor.$gtype &&
+            root.constructor.$gtype.name === 'MetaBackgroundActor') {
+            out.push(root);
+            return; // a BackgroundActor has no BackgroundActor children
+        }
+        const n = root.get_n_children ? root.get_n_children() : 0;
+        for (let i = 0; i < n; i++)
+            this._collectBackgroundActors(root.get_child_at_index(i), out);
+    }
+
+    // Retarget a batch of MetaBackgroundActors to our current image, tracking
+    // each in `tracked` (a Set) so we stash the native background once and prune
+    // the reference when the actor is destroyed. Used for both the overview and
+    // the workspace-switch animation, which build independent gsettings-driven
+    // BackgroundManagers in their own actor trees.
+    _retargetToCurrent(actors, tracked, logTag) {
+        const current = this._currentEntry();
+        if (!current)
+            return;
+        for (const actor of actors) {
+            try {
+                if (!tracked.has(actor)) {
+                    actor[MINE_PROP + ':origBg'] = actor.content.background;
+                    tracked.add(actor);
+                    const destroyId = actor.connect('destroy', () => {
+                        tracked.delete(actor);
+                        try {
+                            actor.disconnect(destroyId);
+                        } catch (_e) { /* already torn down */ }
+                    });
+                }
+                // Same eased image + black letterbox base as the desktop.
+                actor.content.set({ background: current.background });
+            } catch (e) {
+                logError(e, `wallpaper-ease: retarget ${logTag} bg failed`);
+            }
+        }
+    }
+
+    _syncOverview() {
+        let actors = [];
+        try {
+            this._collectBackgroundActors(Main.layoutManager.overviewGroup, actors);
+        } catch (e) {
+            logError(e, 'wallpaper-ease: overview traversal failed');
+            return;
+        }
+        this._retargetToCurrent(actors, this._overviewActors, 'overview');
+    }
+
+    // ---- Ctrl+Alt+arrow (and trackpad-swipe) workspace switch ----
+    // WorkspaceAnimationController builds fresh WorkspaceGroup(s) per switch,
+    // each with its own gsettings BackgroundManager, inserted into Main.uiGroup
+    // above the window group. Without retargeting, the native (different) image
+    // slides across for the whole transition. The ShellWM 'switch-workspace'
+    // signal fires that build; the shell's own WindowManager handler is connected
+    // at startup (before us) and runs animateSwitch() synchronously, so by the
+    // time our handler runs the groups already exist.
+    _watchWorkspaceSwitch() {
+        try {
+            this._switchSignal =
+                global.window_manager.connect('switch-workspace',
+                    () => this._onWorkspaceSwitch());
+        } catch (e) {
+            logError(e, 'wallpaper-ease: workspace-switch watch unavailable');
+        }
+    }
+
+    _unwatchWorkspaceSwitch() {
+        if (this._switchSignal) {
+            try {
+                global.window_manager.disconnect(this._switchSignal);
+            } catch (_e) { /* already gone */ }
+            this._switchSignal = 0;
+        }
+        if (this._switchIdle) {
+            GLib.source_remove(this._switchIdle);
+            this._switchIdle = 0;
+        }
+    }
+
+    _onWorkspaceSwitch() {
+        // Immediate pass: handles the normal ordering where groups are built.
+        this._syncSwitchGroups();
+        // Idle backstop: if our handler ever runs before the build, catch the
+        // groups on the next main-loop iteration before any visible frame latches.
+        if (this._switchIdle)
+            GLib.source_remove(this._switchIdle);
+        this._switchIdle = GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+            this._switchIdle = 0;
+            this._syncSwitchGroups();
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    _syncSwitchGroups() {
+        let actors = [];
+        try {
+            const ctrl = Main.wm && Main.wm._workspaceAnimation;
+            const monitors = ctrl && ctrl._switchData && ctrl._switchData.monitors;
+            if (monitors && monitors.length) {
+                for (const monitorGroup of monitors)
+                    this._collectBackgroundActors(monitorGroup, actors);
+            }
+        } catch (e) {
+            logError(e, 'wallpaper-ease: switch-group traversal failed');
+        }
+        if (actors.length)
+            this._retargetToCurrent(actors, this._switchActors, 'switch');
+    }
+
+    // Only ever called from disable(). These actors are normally already
+    // destroyed when the switch completes; restore survivors defensively.
+    _restoreTracked(tracked, logTag) {
+        for (const actor of tracked) {
+            try {
+                if (actor.is_destroyed && actor.is_destroyed())
+                    continue;
+                const orig = actor[MINE_PROP + ':origBg'];
+                if (orig && actor.content)
+                    actor.content.set({ background: orig });
+            } catch (e) {
+                logError(e, `wallpaper-ease: restore ${logTag} bg failed`);
+            }
+            try {
+                delete actor[MINE_PROP + ':origBg'];
+            } catch (_e) { /* actor gone */ }
+        }
+        tracked.clear();
+    }
+
+    // Only ever called from disable(). Overview actors are normally already
+    // destroyed by then; restore any that somehow survived, tolerating dead ones.
+    _restoreOverview() {
+        this._restoreTracked(this._overviewActors, 'overview');
+    }
+
+    _currentEntry() {
+        // The fully-revealed (on-top) actor is the last one still in _actors
+        // during a fade; once _finishFade runs, _actors holds exactly the keeper.
+        if (this._actors.length === 0)
+            return null;
+        return this._actors[this._actors.length - 1];
     }
 
     _watchPlaylist() {
@@ -406,6 +610,13 @@ var WallpaperEase = class WallpaperEase {
             }
         }
         this._crossfading = false;
+        // If the overview is open during a rotation, keep it on the new image.
+        if (Main.overview.visible)
+            this._syncOverview();
+        // Same for an in-flight workspace-switch animation (rare, but cheap).
+        const ctrl = Main.wm && Main.wm._workspaceAnimation;
+        if (ctrl && ctrl._switchData)
+            this._syncSwitchGroups();
         if (this._running)
             this._scheduleNext();
     }

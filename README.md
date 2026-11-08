@@ -1,8 +1,14 @@
 # gnome-wallpaper-slideshow
 
 A lightweight, daemon-free GNOME wallpaper **and lock-screen** slideshow driven
-by a folder of images, with optional GPU super-resolution for small photos.
-Built and verified on **Ubuntu 22.04 (GNOME 42, Wayland)**, RTX 5090 D.
+by a folder of images, with an iOS-style 60 fps eased crossfade delivered by a
+small GNOME Shell extension. Built and verified on **Ubuntu 22.04 (GNOME 42)**,
+single 4K monitor.
+
+GPU super-resolution for small photos is a separate, optional repo —
+[`image-quality-toolkit`](https://github.com/JiadaoZ22/image-quality-toolkit).
+This repo works fully on its own; the toolkit only enhances sub-screen images
+that the slideshow then picks up through a shared manifest.
 
 ## Why this design
 
@@ -11,22 +17,20 @@ desktop shell does the work, so no third-party app and no resident process is
 needed. This repo provides:
 
 1. `bin/make-slideshow` — a stdlib-only Python **oneshot** that scans a folder,
-   substitutes super-resolved versions of small images, writes an atomically
-   versioned slideshow XML, and points GNOME at it (desktop **and** lock screen,
-   light + dark). It runs in milliseconds and exits.
-2. `bin/upscale-wallpapers` — a **batch** tool that super-resolves images
-   smaller than the screen with [Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN)
-   (ncnn Vulkan, GPU), with a Pillow letterbox fallback when the engine is absent.
-3. A systemd **path unit** (kernel `inotify`, essentially free, no polling)
-   that re-runs the generator whenever the gallery changes, plus **timers** as
-   daily/boot backstops, and a separate SR service+timer.
-4. Burst coalescing via `flock` plus a debounce, so a bulk download can't
+   substitutes any super-resolved versions listed in the toolkit's manifest,
+   writes an atomically versioned slideshow XML plus the extension's
+   `playlist.json` / `extension-config.json`, and points GNOME at it (desktop
+   **and** lock screen, light + dark). It runs in milliseconds and exits.
+2. A systemd **path unit** (kernel `inotify`, essentially free, no polling)
+   that re-runs the generator whenever the gallery changes, plus a **timer** as
+   a daily/boot backstop.
+3. Burst coalescing via `flock` plus a debounce, so a bulk download can't
    trigger hundreds of regenerations.
+4. A GNOME Shell **extension** that replaces the shell's choppy native 1 Hz
+   linear fade with a smooth, eased crossfade (see below).
 
 Idle cost: **0 wallpaper processes, ~0 CPU/RAM** — only the inotify watch,
-timer entries, and an occasional GPU batch. Contrast with Shotwell/Variety,
-which install a large dependency tree and/or keep a GUI/daemon running and
-don't auto-refresh a folder as cleanly.
+timer entries, and one timeout inside the shell process.
 
 ## Fit, aspect ratio and black bars
 
@@ -35,10 +39,11 @@ don't auto-refresh a folder as cleanly.
   any unfilled area is black. Vertical and ultrawide photos get side/top bars;
   nothing is cropped (unlike `zoom`).
 - **Never upscale past the enhanced size.** Images at/above the screen in one
-  dimension are only downscaled. Images smaller than the screen in **both**
-  dimensions are Real-ESRGAN-enhanced (×4) first; if a photo is so small that
-  even ×4 does not reach the screen, it is centered at its true SR size on a
-  black 4K canvas instead of being enlarged further.
+  dimension are only downscaled. If the optional image-quality-toolkit is
+  installed, images smaller than the screen in **both** dimensions are
+  Real-ESRGAN-enhanced (×4) first; if a photo is so small that even ×4 does not
+  reach the screen, it is centered at its true enhanced size on a black canvas
+  rather than being enlarged further.
 
 ## Smooth iOS-style crossfade (the Wallpaper Ease extension)
 
@@ -63,6 +68,12 @@ and renders the swap at the shell's full frame rate:
 - the **new image is fully decoded before the fade starts** and the old actor
   stays fully opaque underneath, so the screen is never under-filled (no black
   dip, no missing-image flash);
+- it also retargets the **Activities overview** and the
+  **Ctrl+Alt+arrow workspace-switch** backgrounds — separate shell
+  `BackgroundManager`s that otherwise keep showing the native slideshow and
+  drift to a different image (a different wallpaper flashing when you press
+  **Win** or switch desktops). No restore happens mid-animation, so there is no
+  flash when the overview closes or a switch completes;
 - reads a JSON `playlist.json` + `extension-config.json` written by
   `make-slideshow` and hot-reloads them via `GFileMonitor` — change
   `DURATION`/`TRANSITION`, regenerate, and the new timing applies **without a
@@ -133,16 +144,14 @@ monitors its JSON inputs).
 ```bash
 git clone https://github.com/JiadaoZ22/gnome-wallpaper-slideshow.git
 cd gnome-wallpaper-slideshow
-# Optional GPU engine (portable; no CUDA/PyTorch), expected at:
-#   ~/.local/opt/realesrgan-ncnn-vulkan/realesrgan-ncnn-vulkan
-# Without it, small images use the Pillow letterbox fallback instead.
 ./install.sh
 ```
 
-The installer deploys both binaries and all five user units, syncs any new
-config keys into an existing config (your values are never overwritten),
-starts the slideshow watcher/timers, and launches the SR batch with
-`--no-block` (it does not wait for the GPU job to finish).
+The installer deploys the generator and the three slideshow user units, syncs
+any new config keys into an existing config (your values are never
+overwritten), starts the watcher/timer, and installs + enables the extension.
+If the image-quality-toolkit is also present it kicks off its SR batch;
+otherwise it simply notes that SR is optional.
 
 Custom gallery or timings:
 
@@ -155,57 +164,42 @@ systemctl --user start wallpaper-slideshow.service
 
 `config` keys: `GALLERY_DIR`, `DURATION` (seconds per image), `TRANSITION`
 (cross-fade seconds), `PICTURE_OPTIONS`, `SET_LOCKSCREEN`, `RANDOM` (1/0),
-`EXTENSIONS`, `KEEP`, `DEBOUNCE`, `SCREEN_W/H`, `MIN_DIMENSION`, `SR_MODEL`,
-`TILE_SIZE`, `JPEG_QUALITY`.
+`EXTENSIONS`, `KEEP`, `DEBOUNCE`.
 
-## Low-resolution pruning
+## Optional GPU super-resolution (image-quality-toolkit)
 
-`bin/prune-lowres` enforces a quality floor: any image whose **width or height**
-is below `MIN_DIMENSION` (default 1080 px) is too low-res for the 4K display and
-is moved out of the gallery. It runs automatically as the `ExecStartPre` of the
-SR service, so a prune happens before every batch and on the daily timer.
+Small photos are enhanced by the separate, self-contained
+[**image-quality-toolkit**](https://github.com/JiadaoZ22/image-quality-toolkit)
+repo (portable Real-ESRGAN ncnn-Vulkan engine vendored; no CUDA/PyTorch). Its
+`wallpaper-upscale.service` runs `prune-lowres` → `upscale-wallpapers` →
+`make-slideshow --force` on a timer and writes its manifest to the exact path
+this repo's generator reads
+(`~/.local/state/gnome-wallpaper-slideshow/upscale-manifest.json`), so SR images
+go live automatically. The two integrate through:
 
-- It **moves, never hard-deletes**. Offenders go to a dated sibling folder
-  `../_lowres_quarantine_<timestamp>/` (outside the watched gallery), preserving
-  relative paths, with a `manifest.json`/`manifest.txt` recording original and
-  new paths plus dimensions — fully reversible by moving files back.
-- It also removes the moved images' SR-manifest entries and cached outputs so no
-  stale reference can reach the slideshow.
-- Set `MIN_DIMENSION=0` to disable. Inspect without touching anything:
-  `~/.local/bin/prune-lowres --dry-run`.
+- `~/.config/image-quality-toolkit/wallpaper-integration.env` (installed by the
+  toolkit) which points its neutral defaults at this repo's gallery/cache/state;
+- the shared config file `~/.config/gnome-wallpaper-slideshow/config`.
 
-## Super-resolution details
-
-- Engine: Real-ESRGAN ncnn Vulkan, model `realesrgan-x4plus` (general photos),
-  GPU device 0. A photo is processed only when it is below the screen in both
-  dimensions; results are cached under
-  `~/.local/share/gnome-wallpaper-slideshow/upscaled/<hash>/prepared.jpg` and
-  keyed by source mtime, so re-runs only process new/changed images.
-- Run on demand: `~/.local/bin/upscale-wallpapers [--rebuild] [--limit N]`.
-- `wallpaper-upscale.timer` runs it daily (04:05) and 30 min after boot. Each
-  run is `prune-lowres` → `upscale-wallpapers` → `make-slideshow --force`.
-- The upscale service's `ExecStartPost` rebuilds the slideshow so new SR images
-  go live automatically. `make-slideshow` degrades gracefully: if a prepared
-  file is missing, it references the original image instead.
+Without the toolkit, the slideshow simply uses original images with contain
+fit and black bars — nothing breaks. See the toolkit's README for
+`prune-lowres` (recoverable quarantine of sub-`MIN_DIMENSION` images), the SR
+cache layout, GPU device selection, and its own troubleshooting.
 
 ## Verify
 
 ```bash
-systemctl --user status wallpaper-slideshow.path wallpaper-upscale.timer
+systemctl --user status wallpaper-slideshow.path wallpaper-slideshow.timer
 systemctl --user list-timers | grep wallpaper
 gsettings get org.gnome.desktop.background picture-uri
 gsettings get org.gnome.desktop.screensaver picture-uri
 tail -f ~/.local/state/gnome-wallpaper-slideshow/run.log
-tail -f ~/.local/state/gnome-wallpaper-slideshow/upscale.log
 ```
 
 Trigger actions manually:
 
 ```bash
 systemctl --user start wallpaper-slideshow.service   # rebuild slideshow now
-systemctl --user start wallpaper-upscale.service      # prune + SR batch + rebuild
-~/.local/bin/prune-lowres --dry-run                   # list sub-MIN_DIMENSION images
-~/.local/bin/prune-lowres                             # quarantine them now
 ~/.local/bin/make-slideshow --force --verbose         # direct, bypass debounce
 ~/.local/bin/make-slideshow --no-apply                # write XML, don't touch gsettings
 ```
@@ -223,14 +217,15 @@ rm -rf ~/.local/share/gnome-shell/extensions/gnome-wallpaper-ease@jiadaoz22.gith
 ./uninstall.sh --purge   # also delete config, generator, logs and generated XML
 ```
 
+The image-quality-toolkit and its SR cache are left intact; remove them with
+that repo's own uninstaller.
+
 ## Layout
 
 ```
 bin/make-slideshow            oneshot slideshow + playlist/config generator
-bin/upscale-wallpapers        batch Real-ESRGAN + letterbox (Pillow + ncnn)
-bin/prune-lowres              move sub-MIN_DIMENSION images to a quarantine
 extension/<uuid>/             GNOME Shell extension: 60fps EASE_IN_OUT_CUBIC fade
-  extension.js                  two Meta.Background actors, JSON playlist driven
+  extension.js                  two Meta.Background actors; overview + switch sync
   metadata.json / stylesheet.css
 scripts/
   install-extension.sh        copy + enable the extension (idempotent)
@@ -240,10 +235,11 @@ systemd/
   wallpaper-slideshow.service oneshot regeneration job
   wallpaper-slideshow.path    inotify watcher on the gallery
   wallpaper-slideshow.timer   daily/boot backstop
-  wallpaper-upscale.service   prune (ExecStartPre) + GPU SR + slideshow rebuild
-  wallpaper-upscale.timer     daily/boot SR re-scan
 install.sh / uninstall.sh     user-level (no root except optional linger)
 ```
+
+The `wallpaper-upscale.{service,timer}` units and the `upscale-wallpapers` /
+`prune-lowres` binaries live in **image-quality-toolkit**, not here.
 
 ## Troubleshooting
 
@@ -268,20 +264,14 @@ Note the two layers differ on purpose:
 After editing the generator, **re-run `./install.sh`** — the service runs the
 deployed `~/.local/bin/make-slideshow`, so a source-only fix has no effect.
 
-### Real-ESRGAN reports an invalid GPU device
+### Different image flashes when opening Activities (Win) or switching desktops
 
-Valid `-g` ids are integers (`0`, `1`, …), not `-1`. Here device `0` is the
-NVIDIA RTX 5090 D; other ids can be an llvmpipe CPU adapter. The scripts pin
-`-g 0`. Check which GPUs the engine sees:
-
-```bash
-~/.local/opt/realesrgan-ncnn-vulkan/realesrgan-ncnn-vulkan 2>&1 | grep -i gpu
-nvidia-smi --query-compute-apps=pid,used_memory --format=csv
-```
-
-If the binary is missing entirely, `upscale-wallpapers` still succeeds via its
-Pillow letterbox fallback (correct fit, just not AI-enhanced), so the pipeline
-never blocks.
+Those surfaces use separate shell `BackgroundManager`s. The extension retargets
+both the overview (`Main.overview` `showing`/`shown`) and the workspace-switch
+groups (`global.window_manager` `switch-workspace`) to the current image. If a
+mismatch returns, confirm the extension is `ENABLED` and was reloaded after the
+last `extension.js` edit, then check `journalctl --user -b | grep wallpaper-ease`
+for a retarget error.
 
 ## Limitations
 
@@ -291,3 +281,5 @@ never blocks.
 - GNOME's static-wallpaper XML format doesn't play video; `.mp4` is ignored.
 - This targets GNOME Shell (Ubuntu). Other desktops (KDE, Xfce) use different
   wallpaper mechanisms.
+- The lock screen intentionally keeps the native XML slideshow (it must work
+  before/outside the session), so it does not get the eased crossfade.

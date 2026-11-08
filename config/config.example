@@ -5,7 +5,7 @@
 
 # Folder scanned for images (recursive). Temporary/partial downloads and
 # non-image files are skipped automatically.
-GALLERY_DIR=/home/you/Documents/1_Gallery/b_Processed
+GALLERY_DIR=~/Documents/1_Gallery/b_Processed
 
 # How long each image stays, and the cross-fade length, in seconds.
 # Desktop: the Wallpaper Ease shell extension uses these to drive a 60fps
@@ -39,17 +39,7 @@ KEEP=5
 # disable. Override a single run with: make-slideshow --force
 DEBOUNCE=20
 
-# ---- Real-ESRGAN super-resolution (small images only) ----
-# Screen geometry; images below BOTH dimensions are enhanced so the contain
-# fit never enlarges a photo past its AI-upscaled size.
-SCREEN_W=3840
-SCREEN_H=2160
-# Quarantine (move to a dated *_lowres_quarantine_* sibling, never hard-delete)
-# any image whose width OR height is below this many pixels. Set 0 to disable.
-# Runs before every SR batch so ultra-low-res photos never reach the slideshow.
-MIN_DIMENSION=1080
-# Portable ncnn-Vulkan build; runs on the RTX 5090 D (gpu 0). realesrgan-x4plus
-# is the general-photo model bundled in the release.
-SR_MODEL=realesrgan-x4plus
-TILE_SIZE=400
-JPEG_QUALITY=92
+# NOTE: super-resolution and low-res pruning live in the separate
+# image-quality-toolkit repo. When installed, its wallpaper-upscale.service
+# reads this same file for GALLERY_DIR (and any SR_*/MIN_DIMENSION overrides you
+# add) and writes the SR manifest make-slideshow consumes — no SR keys here.

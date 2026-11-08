@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
 # Remove the wallpaper slideshow user units and restore a static wallpaper.
 # Does NOT delete your gallery images or the generated XML unless --purge is given.
+#
+# Scope: this only removes slideshow pieces. The image-quality-toolkit's
+# wallpaper-upscale.{service,timer} and its upscale-wallpapers/prune-lowres
+# binaries are owned by that repo — use its own uninstaller for them. Legacy
+# copies left by the old combined installer are cleaned up defensively below.
 set -euo pipefail
 
-echo "==> Stopping and disabling user units"
+echo "==> Stopping and disabling slideshow user units"
 systemctl --user disable --now wallpaper-slideshow.path   2>/dev/null || true
 systemctl --user disable --now wallpaper-slideshow.timer  2>/dev/null || true
-systemctl --user disable --now wallpaper-upscale.timer    2>/dev/null || true
 systemctl --user stop wallpaper-slideshow.service         2>/dev/null || true
-systemctl --user stop wallpaper-upscale.service           2>/dev/null || true
 
 echo "==> Disabling and removing the Wallpaper Ease shell extension"
 UUID="gnome-wallpaper-ease@jiadaoz22.github.com"
@@ -29,12 +32,16 @@ PY
 rm -rf "$HOME/.local/share/gnome-shell/extensions/$UUID"
 
 UNIT_DIR="$HOME/.config/systemd/user"
-echo "==> Removing unit files"
+echo "==> Removing slideshow unit files"
 rm -f "$UNIT_DIR/wallpaper-slideshow.service" \
       "$UNIT_DIR/wallpaper-slideshow.path" \
-      "$UNIT_DIR/wallpaper-slideshow.timer" \
-      "$UNIT_DIR/wallpaper-upscale.service" \
-      "$UNIT_DIR/wallpaper-upscale.timer"
+      "$UNIT_DIR/wallpaper-slideshow.timer"
+# Legacy: the combined installer used to ship these here. Only remove if the
+# image-quality-toolkit is not currently providing them.
+if [ ! -x "$HOME/.local/bin/upscale-wallpapers" ]; then
+  rm -f "$UNIT_DIR/wallpaper-upscale.service" \
+        "$UNIT_DIR/wallpaper-upscale.timer"
+fi
 systemctl --user daemon-reload
 
 echo "==> Pointing the desktop and lock screen back to a single static image"
@@ -51,14 +58,13 @@ else
 fi
 
 if [ "${1:-}" = "--purge" ]; then
-  echo "==> Purging config, generators, logs, XML and SR cache"
-  rm -f "$HOME/.local/bin/make-slideshow" "$HOME/.local/bin/upscale-wallpapers" \
-        "$HOME/.local/bin/prune-lowres"
+  echo "==> Purging config, generator, logs and generated XML"
+  rm -f "$HOME/.local/bin/make-slideshow"
   rm -rf "$HOME/.config/gnome-wallpaper-slideshow"
   rm -rf "$HOME/.local/state/gnome-wallpaper-slideshow"
   rm -rf "$HOME/.local/share/backgrounds/gnome-wallpaper-slideshow"
-  echo "    purged (the Real-ESRGAN binary under ~/.local/opt is left intact)"
+  echo "    purged (image-quality-toolkit and its SR cache are left intact)"
 else
-  echo "==> Kept config/XML/SR cache (use '$0 --purge' to remove them too)"
+  echo "==> Kept config/XML (use '$0 --purge' to remove them too)"
 fi
 echo "Uninstall complete."

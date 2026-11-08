@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
-# Idempotent user-level installer for the GNOME wallpaper slideshow + SR.
+# Idempotent user-level installer for the GNOME wallpaper slideshow.
 # No sudo: everything lives under $HOME and in the user systemd manager.
+#
+# Scope: this repo only installs the slideshow generator, its path/timer units,
+# and the Wallpaper Ease shell extension. GPU super-resolution and low-res
+# pruning live in the separate image-quality-toolkit repo (install that too if
+# you want small photos enhanced); this installer does not depend on it.
 set -euo pipefail
 
 # install.sh lives at the REPO ROOT, so SRC is the script's own directory.
@@ -21,11 +26,9 @@ DEFAULT_GALLERY="$HOME/Documents/1_Gallery/b_Processed"
 #   GALLERY_DIR=/path/to/pics ./install.sh
 GALLERY_DIR="${GALLERY_DIR:-$DEFAULT_GALLERY}"
 
-echo "==> Installing generators to $BIN_DIR"
+echo "==> Installing generator to $BIN_DIR"
 mkdir -p "$BIN_DIR"
-install -m 0755 "$SRC/bin/make-slideshow"     "$BIN_DIR/make-slideshow"
-install -m 0755 "$SRC/bin/upscale-wallpapers" "$BIN_DIR/upscale-wallpapers"
-install -m 0755 "$SRC/bin/prune-lowres"       "$BIN_DIR/prune-lowres"
+install -m 0755 "$SRC/bin/make-slideshow" "$BIN_DIR/make-slideshow"
 
 echo "==> Writing config to $CONFIG_DIR/config"
 mkdir -p "$CONFIG_DIR"
@@ -46,10 +49,10 @@ else
 fi
 chmod 0644 "$CONFIG_DIR/config"
 
-echo "==> Installing systemd user units to $UNIT_DIR"
+echo "==> Installing slideshow user units to $UNIT_DIR"
 mkdir -p "$UNIT_DIR"
 for unit in wallpaper-slideshow.service wallpaper-slideshow.path \
-            wallpaper-slideshow.timer wallpaper-upscale.service wallpaper-upscale.timer; do
+            wallpaper-slideshow.timer; do
   src_unit="$SRC/systemd/$unit"
   dst_unit="$UNIT_DIR/$unit"
   if [ "$GALLERY_DIR" != "$DEFAULT_GALLERY" ]; then
@@ -62,19 +65,21 @@ done
 echo "==> Reloading user systemd"
 systemctl --user daemon-reload
 
-echo "==> Enabling slideshow path watcher + timers (persistent across reboots)"
+echo "==> Enabling slideshow path watcher + timer (persistent across reboots)"
 systemctl --user enable --now wallpaper-slideshow.path
 systemctl --user enable --now wallpaper-slideshow.timer
-systemctl --user enable --now wallpaper-upscale.timer
 
 echo "==> First slideshow regeneration now"
 systemctl --user start wallpaper-slideshow.service || true
 
-# The SR batch is long (~125 images). Start it detached so install never blocks
-# on the oneshot; --no-block returns immediately while the job continues. It is
-# also covered by the daily/boot upscale timer.
-echo "==> Starting Real-ESRGAN batch in the background (GPU 0)"
-systemctl --user start --no-block wallpaper-upscale.service || true
+# The image-quality-toolkit owns wallpaper-upscale.{service,timer}. If it has
+# been installed alongside, nudge its batch once (non-fatal if absent).
+if [ -x "$BIN_DIR/upscale-wallpapers" ] && systemctl --user list-unit-files wallpaper-upscale.service >/dev/null 2>&1; then
+  echo "==> image-quality-toolkit detected; starting its SR batch (detached)"
+  systemctl --user start --no-block wallpaper-upscale.service || true
+else
+  echo "==> (optional) install image-quality-toolkit for GPU super-resolution"
+fi
 
 # Install the in-process shell extension that renders the smooth 60fps
 # ease-in-out crossfade on the desktop. Copied (not symlinked) because the
@@ -94,9 +99,8 @@ fi
 
 echo
 echo "Done. Verify with:"
-echo "  systemctl --user status wallpaper-slideshow.path wallpaper-upscale.service"
+echo "  systemctl --user status wallpaper-slideshow.path wallpaper-slideshow.service"
 echo "  systemctl --user list-timers | grep wallpaper"
 echo "  gsettings get org.gnome.desktop.background picture-uri"
 echo "  gsettings get org.gnome.desktop.screensaver picture-uri"
 echo "  tail -f \$HOME/.local/state/gnome-wallpaper-slideshow/run.log"
-echo "  tail -f \$HOME/.local/state/gnome-wallpaper-slideshow/upscale.log"

@@ -6,6 +6,8 @@ After=graphical-session.target
 Wants=graphical-session.target
 # Default gallery; install.sh rewrites this line if GALLERY_DIR is customized.
 ConditionPathIsDirectory=%h/Documents/1_Gallery/b_Processed
+# Never enter the failed-restart throttle for this harmless coalescing job.
+StartLimitIntervalSec=0
 
 [Service]
 Type=oneshot
@@ -14,8 +16,6 @@ Type=oneshot
 EnvironmentFile=-%h/.config/gnome-wallpaper-slideshow/config
 ExecStart=%h/.local/bin/make-slideshow
 # A bulk download can emit hundreds of inotify events in seconds. oneshot
-# re-queues them; coalesce the burst with a short settle delay, and never
-# enter the failed-restart throttle for this harmless job.
+# re-queues them; coalesce the burst with a short settle delay.
 ExecStartPre=/usr/bin/sleep 2
-StartLimitIntervalSec=0
 TimeoutStartSec=120
