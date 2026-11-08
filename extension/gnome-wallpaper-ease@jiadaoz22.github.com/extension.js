@@ -125,6 +125,8 @@ var WallpaperEase = class WallpaperEase {
         this._monitorSignal = 0;
         this._index = 0;
         this._playlist = [];
+        this._deck = [];              // shuffled indices into _playlist (random order)
+        this._deckPos = 0;            // current position inside _deck
         this._cfg = _loadConfig();
         this._crossfading = false;
         this._nativeHidden = false;
@@ -452,6 +454,26 @@ var WallpaperEase = class WallpaperEase {
         });
     }
 
+    // Fisher-Yates shuffle of the playlist INDICES (the deck). Playing the
+    // deck in order visits every image exactly once before a reshuffle, so
+    // the slide order is random with no repeat within a cycle. `avoidIndex`,
+    // when given, is kept from landing first so the new cycle never opens on
+    // the same image the previous cycle ended on.
+    _shuffleDeck(avoidIndex = -1) {
+        const n = this._playlist.length;
+        this._deck = Array.from({ length: n }, (_unused, i) => i);
+        for (let i = n - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [this._deck[i], this._deck[j]] = [this._deck[j], this._deck[i]];
+        }
+        if (n > 1 && avoidIndex >= 0 && this._deck[0] === avoidIndex) {
+            // Swap the duplicate-opening entry with a random later position.
+            const k = 1 + Math.floor(Math.random() * (n - 1));
+            [this._deck[0], this._deck[k]] = [this._deck[k], this._deck[0]];
+        }
+        this._deckPos = 0;
+    }
+
     _reloadPlaylist() {
         this._cfg = _loadConfig();
         const next = _loadPlaylist(this._cfg.playlistPath);
@@ -460,7 +482,17 @@ var WallpaperEase = class WallpaperEase {
         this._playlist = next;
         const current = this._currentPath();
         const pos = current ? next.indexOf(current) : -1;
-        this._index = pos >= 0 ? pos : 0;
+        // Build a fresh random deck for the new playlist; if the currently
+        // shown image survived the reload, keep it as the deck's first card so
+        // the wallpaper does not visibly jump on a live playlist change.
+        this._shuffleDeck();
+        if (pos >= 0) {
+            const at = this._deck.indexOf(pos);
+            if (at > 0)
+                [this._deck[0], this._deck[at]] = [this._deck[at], this._deck[0]];
+        }
+        this._index = this._deck[0];
+        this._deckPos = 0;
     }
 
     _currentPath() {
@@ -499,8 +531,10 @@ var WallpaperEase = class WallpaperEase {
     }
 
     _startFirst() {
-        this._index = 0;
-        const path = this._playlist[0];
+        // The deck's first card is the starting (random) image.
+        this._deckPos = 0;
+        this._index = this._deck.length ? this._deck[0] : 0;
+        const path = this._playlist[this._index];
         const entry = this._makeEntry(path);
         this._actors.push(entry);
         this._group.add_child(entry.actor);
@@ -530,7 +564,14 @@ var WallpaperEase = class WallpaperEase {
             this._scheduleNext();
             return GLib.SOURCE_REMOVE;
         }
-        this._index = (this._index + 1) % this._playlist.length;
+        const lastIndex = this._index;
+        this._deckPos += 1;
+        if (this._deckPos >= this._deck.length) {
+            // One full random cycle done: reshuffle for a fresh random order,
+            // and make sure the new first card differs from the one just shown.
+            this._shuffleDeck(lastIndex);
+        }
+        this._index = this._deck[this._deckPos];
         this._crossfadeTo(this._playlist[this._index]);
         return GLib.SOURCE_REMOVE;
     }

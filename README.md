@@ -116,6 +116,21 @@ monitors its JSON inputs).
 **17.5 s hold / 2.5 s crossfade.** The same values feed the extension
 (`interval_ms`/`fade_ms`) and the native XML used by the lock screen.
 
+### Random order
+
+Switching is randomized at two layers:
+
+- `make-slideshow` writes a Fisher–Yates-shuffled playlist (`RANDOM=1`), which
+  also sets the order of the native XML slideshow used on the lock screen.
+- The shell extension then plays its own **deck of cards**: it walks a shuffled
+  index deck so every image appears exactly once per cycle with no repeats, and
+  when the deck is exhausted it reshuffles — guaranteeing the new cycle opens
+  on a different image than the previous one ended on. So the order stays random
+  indefinitely rather than replaying one fixed permutation every ~5 h. Set
+  `RANDOM=0` in the config for deterministic sorted order on regeneration (the
+  extension's deck still shuffles; the config governs the generated XML/playlist
+  baseline).
+
 ## What it does
 
 - Recursively includes `jpg jpeg png webp bmp gif`; skips hidden files and
