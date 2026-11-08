@@ -28,7 +28,11 @@ folder as cleanly.
 
 - Recursively includes `jpg jpeg png webp bmp gif`; skips hidden files and
   partial downloads (`.aliyunpan-downloading`, `.part`, `.tmp`, `.crdownload`, …).
-- Handles spaces / non-ASCII paths (percent-encoded URIs, XML-escaped).
+- Handles spaces / parentheses / non-ASCII paths. The slideshow XML uses
+  **raw absolute filesystem paths** (what GNOME Shell expects) with only XML
+  special-char escaping — GNOME does its own percent-encoding; a `file://` URI
+  inside `<file>` breaks loading (see Troubleshooting). The `gsettings` value
+  itself is still a proper `file://` URI pointing at the XML document.
 - Shuffles order on each regeneration (or sorted mode via `RANDOM=0`).
 - Coalesces bulk-download bursts: an inotify debounce (`DEBOUNCE=20`s) plus a
   `flock` means hundreds of simultaneous file events produce a single
@@ -100,6 +104,29 @@ systemd/
   wallpaper-slideshow.timer   daily/boot backstop
 install.sh / uninstall.sh     user-level (no root except optional linger)
 ```
+
+## Troubleshooting
+
+### Desktop background is solid black/dark and never changes
+
+Check the shell log:
+
+```bash
+journalctl --user -b | grep -i 'Failed to load background'
+```
+
+If you see a path like `.../file:/home/.../photo.jpg: No such file`, the
+slideshow XML was written with `file://` URIs inside `<file>/<from>/<to>`.
+GNOME Shell resolves those as **relative to `$HOME`**, so every image fails and
+it falls back to the solid theme color. The correct content is a raw absolute
+path: `<file>/home/you/Pictures/x.jpg</file>` (this generator already does).
+Note the two layers differ on purpose:
+
+- *inside the slideshow XML* → raw absolute path
+- *the `gsettings picture-uri` value* → `file:///…/slideshow-….xml` (a URI)
+
+After editing the generator, **re-run `./install.sh`** — the service runs the
+deployed `~/.local/bin/make-slideshow`, so a source-only fix has no effect.
 
 ## Limitations
 

@@ -20,7 +20,6 @@ import subprocess
 import sys
 import xml.sax.saxutils as sx
 from pathlib import Path
-from urllib.parse import quote
 
 DEFAULTS = {
     "GALLERY_DIR": "~/Documents/1_Gallery/b_Processed",
@@ -74,11 +73,14 @@ def collect_images(gallery: Path, extensions: set[str]) -> list[Path]:
     return sorted(images)
 
 
-def file_uri(path: Path) -> str:
-    # quote() percent-encodes spaces/non-ASCII but keeps "/"; absolute path
-    # then gets the standard three-slash file URI (no doubled slashes).
-    # Escape XML specials on top.
-    return sx.escape("file://" + quote(str(path)))
+def xml_path(path: Path) -> str:
+    # GNOME Shell's slideshow parser wants a RAW absolute filesystem path in
+    # <file>/<from>/<to>, NOT a file:// URI: a URI is treated as relative and
+    # resolved under $HOME, every image fails to load, and the desktop falls
+    # back to the solid theme color (looks like a black/dark screen). GNOME
+    # does its own percent-encoding, so only XML-special chars (&<>"') need
+    # escaping here; spaces, parentheses and non-ASCII names pass through.
+    return sx.escape(str(path))
 
 
 def build_xml(images: list[Path], duration: float, transition: float) -> str:
@@ -101,12 +103,12 @@ def build_xml(images: list[Path], duration: float, transition: float) -> str:
         parts += [
             "  <static>",
             f"    <duration>{duration:.1f}</duration>",
-            f"    <file>{file_uri(img)}</file>",
+            f"    <file>{xml_path(img)}</file>",
             "  </static>",
             "  <transition>",
             f"    <duration>{transition:.1f}</duration>",
-            f"    <from>{file_uri(img)}</from>",
-            f"    <to>{file_uri(nxt)}</to>",
+            f"    <from>{xml_path(img)}</from>",
+            f"    <to>{xml_path(nxt)}</to>",
             "  </transition>",
         ]
     parts.append("</background>")
