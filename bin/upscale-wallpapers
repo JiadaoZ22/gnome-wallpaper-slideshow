@@ -1,0 +1,249 @@
+#!/usr/bin/env python3
+"""Batch super-resolution for gallery images smaller than the screen.
+
+Runs Real-ESRGAN (ncnn Vulkan, GPU) on the RTX 5090 D to enhance small
+photos, then guarantees the no-upscale-past-native-of-SR + aspect-ratio rules:
+  * large images (>= screen in one dimension) are left untouched;
+  * small images are SR-enhanced; if the SR result still does not reach the
+    screen in either dimension, it is letterboxed (black bars) onto a
+    screen-sized canvas at its true SR size - it is NEVER further enlarged;
+  * aspect ratio is always preserved (contain fit), nothing is cropped.
+
+Writes a JSON manifest mapping each gallery-relative source path to the
+prepared file the slideshow should reference. This is a BATCH tool, not a
+daemon: run it on demand or via the wallpaper-upscale timer. The wallpaper
+generator stays millisecond-fast and simply reads this manifest.
+
+Requires Pillow; the GPU path needs the realesrgan-ncnn-vulkan binary.
+If the binary is missing/fails, falls back to Pillow letterbox (still correct,
+just not AI-enhanced) so the pipeline never blocks.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+import shutil
+import struct
+import subprocess
+import sys
+from pathlib import Path
+
+from PIL import Image
+
+# ---- defaults (overridable via environment, matching the service config) ----
+DEFAULTS = {
+    "GALLERY_DIR": "~/Documents/1_Gallery/b_Processed",
+    "CACHE_DIR": "~/.local/share/gnome-wallpaper-slideshow/upscaled",
+    "STATE_DIR": "~/.local/state/gnome-wallpaper-slideshow",
+    "MANIFEST": "~/.local/state/gnome-wallpaper-slideshow/upscale-manifest.json",
+    "REALESRGAN_BIN": "~/.local/opt/realesrgan-ncnn-vulkan/realesrgan-ncnn-vulkan",
+    "SR_MODEL": "realesrgan-x4plus",  # full-quality photo model shipped in the bundle
+    "SCREEN_W": "3840",
+    "SCREEN_H": "2160",
+    "JPEG_QUALITY": "92",
+    "TILE_SIZE": "400",
+    "EXTENSIONS": "jpg,jpeg,png,webp,bmp,gif",
+}
+EXCLUDE_SUFFIXES = (".aliyunpan-downloading", ".part", ".tmp", ".download",
+                    ".crdownload", "~")
+
+
+def env(key: str) -> str:
+    val = os.environ.get(key)
+    return val if val not in (None, "") else os.path.expanduser(DEFAULTS[key])
+
+
+def log(state_dir: Path, msg: str) -> None:
+    state_dir.mkdir(parents=True, exist_ok=True)
+    line = f"{dt.datetime.now().isoformat(timespec='seconds')} {msg}\n"
+    with (state_dir / "upscale.log").open("a", encoding="utf-8") as fh:
+        fh.write(line)
+    print(line, end="")
+
+
+def header_dims(p: Path):
+    """Fast dimension read (Pillow used elsewhere); kept cheap for the scan."""
+    try:
+        with Image.open(p) as im:
+            return im.size  # (w, h), honors EXIF orientation via .size for JPEG
+    except Exception:
+        return None
+
+
+def collect(gallery: Path, exts: set[str]) -> list[Path]:
+    out = []
+    for root, _, files in os.walk(gallery):
+        for name in files:
+            if name.startswith(".") or name.lower().endswith(EXCLUDE_SUFFIXES):
+                continue
+            if name.lower().rsplit(".", 1)[-1] not in exts:
+                continue
+            out.append(Path(root) / name)
+    return sorted(out)
+
+
+def need_upscale(w: int, h: int, sw: int, sh: int) -> bool:
+    # GNOME 'scaled' enlarges only when BOTH dims are below the screen.
+    return w < sw and h < sh
+
+
+def run_realesrgan(bin_path: Path, model: str, tile: str, src: Path, dst_png: Path) -> bool:
+    if not bin_path.exists():
+        return False
+    dst_png.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [str(bin_path), "-i", str(src), "-o", str(dst_png),
+           "-n", model, "-t", tile, "-g", "0", "-f", "png"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        return r.returncode == 0 and dst_png.exists() and dst_png.stat().st_size > 0
+    except Exception:
+        return False
+
+
+def letterbox_canvas(im: Image.Image, sw: int, sh: int) -> Image.Image:
+    """Center 'im' on a black screen canvas at its own size (no enlargement)."""
+    canvas = Image.new("RGB", (sw, sh), (0, 0, 0))
+    w, h = im.size
+    x = (sw - w) // 2
+    y = (sh - h) // 2
+    if im.mode in ("RGBA", "LA", "P"):
+        im = im.convert("RGB")
+    canvas.paste(im, (x, y))
+    return canvas
+
+
+def prepare_one(src: Path, rel: str, cache_dir: Path, sw: int, sh: int,
+                quality: int, bin_path: Path, model: str, tile: str, state: Path) -> dict:
+    """Return a manifest record for one source image."""
+    key = hashlib.sha1(rel.encode("utf-8")).hexdigest()[:16]
+    out_dir = cache_dir / key
+    final = out_dir / "prepared.jpg"
+    dims = header_dims(src)
+    if not dims:
+        return {"rel": rel, "prepared": None, "reason": "unreadable", "method": "skip"}
+    w, h = dims
+    if not need_upscale(w, h, sw, sh):
+        return {"rel": rel, "prepared": None, "reason": "already >= screen in one dim",
+                "method": "original", "src_w": w, "src_h": h}
+
+    # Already prepared and source unchanged -> reuse.
+    src_mtime = int(src.stat().st_mtime)
+    if final.exists():
+        meta = out_dir / "meta.json"
+        if meta.exists():
+            try:
+                old = json.loads(meta.read_text())
+                if old.get("src_mtime") == src_mtime:
+                    return {**old, "rel": rel, "prepared": str(final)}
+            except Exception:
+                pass
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    sr_png = out_dir / "sr.png"
+    method = "realesrgan"
+    ok = run_realesrgan(bin_path, model, tile, src, sr_png)
+    try:
+        if ok:
+            im = Image.open(sr_png).convert("RGB")
+        else:
+            # Fallback: open original (no AI), still honor the no-enlarge rule.
+            method = "pillow-letterbox-fallback"
+            log(state, f"WARN Real-ESRGAN unavailable/failed for {rel}; Pillow letterbox")
+            im = Image.open(src).convert("RGB")
+
+        sw_, sh_ = im.size
+        if sw_ < sw and sh_ < sh:
+            # SR result still below screen in BOTH dims: letterbox at true size.
+            im = letterbox_canvas(im, sw, sh)
+            method += "+letterbox"
+        else:
+            # Reaches the screen in >=1 dim: contain downscale to fit, keep AR.
+            scale = min(sw / sw_, sh / sh_)
+            if scale < 1.0:
+                im = im.resize((max(1, round(sw_ * scale)), max(1, round(sh_ * scale))),
+                               Image.LANCZOS)
+        im.save(final, "JPEG", quality=quality, optimize=True)
+    finally:
+        if sr_png.exists():
+            sr_png.unlink(missing_ok=True)
+
+    rec = {"rel": rel, "prepared": str(final), "method": method,
+           "src_w": w, "src_h": h, "src_mtime": src_mtime,
+           "out_w": im.size[0], "out_h": im.size[1]}
+    (out_dir / "meta.json").write_text(json.dumps(rec, indent=2), encoding="utf-8")
+    return rec
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Batch SR-enhance sub-screen gallery images.")
+    ap.add_argument("--rebuild", action="store_true", help="ignore cached prepared files")
+    ap.add_argument("--limit", type=int, default=0, help="process at most N small images (0=all)")
+    ap.add_argument("--verbose", action="store_true")
+    args = ap.parse_args()
+
+    gallery = Path(os.path.expanduser(env("GALLERY_DIR")))
+    cache_dir = Path(os.path.expanduser(env("CACHE_DIR")))
+    state_dir = Path(os.path.expanduser(env("STATE_DIR")))
+    manifest_path = Path(os.path.expanduser(env("MANIFEST")))
+    bin_path = Path(os.path.expanduser(env("REALESRGAN_BIN")))
+    model = env("SR_MODEL")
+    tile = env("TILE_SIZE")
+    sw, sh = int(env("SCREEN_W")), int(env("SCREEN_H"))
+    quality = int(env("JPEG_QUALITY"))
+    exts = {e.strip().lower() for e in env("EXTENSIONS").split(",") if e.strip()}
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    state_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.rebuild and cache_dir.exists():
+        shutil.rmtree(cache_dir)
+
+    manifest = {}
+    if manifest_path.exists():
+        try:
+            manifest = json.loads(manifest_path.read_text())
+        except Exception:
+            manifest = {}
+
+    images = collect(gallery, exts)
+    small = []
+    for p in images:
+        d = header_dims(p)
+        if d and need_upscale(d[0], d[1], sw, sh):
+            small.append(p)
+    log(state_dir, f"scan total={len(images)} sub_screen={len(small)} bin={'yes' if bin_path.exists() else 'MISSING'}")
+    if args.limit:
+        small = small[: args.limit]
+
+    processed = failed = 0
+    for i, src in enumerate(small, 1):
+        rel = str(src.relative_to(gallery))
+        try:
+            rec = prepare_one(src, rel, cache_dir, sw, sh, quality, bin_path, model, tile, state_dir)
+            if rec.get("prepared"):
+                manifest[rel] = rec
+                processed += 1
+            else:
+                failed += 1
+            if args.verbose or i % 10 == 0 or i == len(small):
+                log(state_dir, f"[{i}/{len(small)}] {rec.get('method')} {rel}")
+        except Exception as e:  # never let one bad image kill the batch
+            failed += 1
+            log(state_dir, f"ERROR {rel}: {e}")
+
+    # Atomically publish the manifest.
+    tmp = manifest_path.with_suffix(".json.tmp")
+    manifest["_meta"] = {"updated": dt.datetime.now().isoformat(timespec="seconds"),
+                         "screen": [sw, sh], "model": model,
+                         "total_images": len(images), "sub_screen": len(small),
+                         "prepared": processed, "failed": failed}
+    tmp.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    os.replace(tmp, manifest_path)
+    log(state_dir, f"DONE prepared={processed} failed={failed} manifest={manifest_path.name}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

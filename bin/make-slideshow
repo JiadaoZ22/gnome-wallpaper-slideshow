@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import fcntl
+import json
 import os
 import random
 import subprocess
@@ -25,9 +26,13 @@ DEFAULTS = {
     "GALLERY_DIR": "~/Documents/1_Gallery/b_Processed",
     "OUTPUT_DIR": "~/.local/share/backgrounds/gnome-wallpaper-slideshow",
     "STATE_DIR": "~/.local/state/gnome-wallpaper-slideshow",
-    "DURATION": "599.0",        # seconds each image stays up
-    "TRANSITION": "1.5",        # seconds of cross-fade
-    "PICTURE_OPTIONS": "zoom",  # zoom | centered | scaled | stretched | wallpaper | none
+    "MANIFEST": "~/.local/state/gnome-wallpaper-slideshow/upscale-manifest.json",
+    "DURATION": "15.0",          # seconds each image stays up
+    "TRANSITION": "2.0",         # seconds of cross-fade
+    # 'scaled' = contain fit: whole image visible, aspect preserved, black bars
+    # for any unfilled area; never crops (unlike 'zoom').
+    "PICTURE_OPTIONS": "scaled",  # scaled | zoom | centered | stretched | none
+    "SET_LOCKSCREEN": "1",       # 1 = also drive org.gnome.desktop.screensaver
     "RANDOM": "1",              # 1 = shuffle every regeneration, 0 = sorted
     "KEEP": "5",                # number of old versioned XMLs to retain
     "DEBOUNCE": "20",           # skip if a run happened within N seconds (0 disables)
@@ -115,19 +120,42 @@ def build_xml(images: list[Path], duration: float, transition: float) -> str:
     return "\n".join(parts) + "\n"
 
 
-def gsettings_set(key: str, value: str, state_dir: Path) -> bool:
+def gsettings_set(schema: str, key: str, value: str, state_dir: Path) -> bool:
     if not os.environ.get("DBUS_SESSION_BUS_ADDRESS"):
-        log(state_dir, f"WARN DBUS_SESSION_BUS_ADDRESS unset; wrote XML but could not set {key} "
+        log(state_dir, f"WARN DBUS_SESSION_BUS_ADDRESS unset; wrote XML but could not set {schema}:{key} "
                        "(will apply on next graphical-session run)")
         return False
     try:
-        subprocess.run(["gsettings", "set", "org.gnome.desktop.background", key, value],
+        subprocess.run(["gsettings", "set", schema, key, value],
                        check=True, capture_output=True, text=True, timeout=20)
         return True
     except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
         detail = getattr(exc, "stderr", str(exc))
-        log(state_dir, f"WARN gsettings {key} failed: {str(detail).strip()}")
+        log(state_dir, f"WARN gsettings {schema}:{key} failed: {str(detail).strip()}")
         return False
+
+
+def load_manifest(manifest_path: Path, gallery: Path, state_dir: Path) -> dict:
+    """Map gallery-relative source path -> prepared (SR/letterbox) absolute path.
+
+    Entries whose prepared file no longer exists are ignored so a cleared cache
+    degrades gracefully to the original images instead of breaking the slideshow.
+    """
+    if not manifest_path.exists():
+        return {}
+    try:
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        log(state_dir, f"WARN unreadable manifest {manifest_path.name}: {e}")
+        return {}
+    mapping = {}
+    for rel, rec in data.items():
+        if rel.startswith("_"):
+            continue
+        prepared = rec.get("prepared") if isinstance(rec, dict) else None
+        if prepared and Path(prepared).exists():
+            mapping[rel] = Path(prepared)
+    return mapping
 
 
 def main() -> int:
@@ -142,6 +170,7 @@ def main() -> int:
     gallery = Path(os.path.expanduser(env("GALLERY_DIR")))
     output_dir = Path(os.path.expanduser(env("OUTPUT_DIR")))
     state_dir = Path(os.path.expanduser(env("STATE_DIR")))
+    manifest_path = Path(os.path.expanduser(env("MANIFEST")))
     output_dir.mkdir(parents=True, exist_ok=True)
     state_dir.mkdir(parents=True, exist_ok=True)
 
@@ -171,10 +200,24 @@ def main() -> int:
         return 0  # oneshot: do not enter a failed-restart loop
 
     extensions = {e.strip().lower() for e in env("EXTENSIONS").split(",") if e.strip()}
-    images = collect_images(gallery, extensions)
-    if not images:
+    raw_images = collect_images(gallery, extensions)
+    if not raw_images:
         log(state_dir, f"WARN no usable images under {gallery}; keeping current wallpaper")
         return 0
+
+    # Substitute SR/letterbox-prepared paths for sub-screen images; every other
+    # photo keeps its original path (the manifest only contains small images).
+    mapping = load_manifest(manifest_path, gallery, state_dir)
+    images = []
+    substituted = 0
+    for p in raw_images:
+        rel = str(p.relative_to(gallery))
+        prep = mapping.get(rel)
+        if prep is not None:
+            images.append(prep)
+            substituted += 1
+        else:
+            images.append(p)
 
     if env("RANDOM") == "1":
         random.shuffle(images)
@@ -209,18 +252,27 @@ def main() -> int:
     if not args.no_apply:
         uri = f"file://{final}"
         ok = True
+        style = env("PICTURE_OPTIONS")
+        # Desktop background (light + dark).
         for key in ("picture-uri", "picture-uri-dark"):
-            ok = gsettings_set(key, uri, state_dir) and ok
-        ok = gsettings_set("picture-options", env("PICTURE_OPTIONS"), state_dir) and ok
+            ok = gsettings_set("org.gnome.desktop.background", key, uri, state_dir) and ok
+        ok = gsettings_set("org.gnome.desktop.background", "picture-options", style, state_dir) and ok
+        # Lock screen: same slideshow XML + same contain style (no dark key here).
+        if env("SET_LOCKSCREEN") == "1":
+            ok = gsettings_set("org.gnome.desktop.screensaver", "picture-uri", uri, state_dir) and ok
+            ok = gsettings_set("org.gnome.desktop.screensaver", "picture-options", style, state_dir) and ok
         applied = "yes" if ok else "xml-only"
 
-    log(state_dir, f"OK images={len(images)} duration={duration:.0f}s transition={transition:.1f}s "
+    log(state_dir, f"OK images={len(images)} sr_substituted={substituted} "
+                   f"duration={duration:.0f}s transition={transition:.1f}s style={env('PICTURE_OPTIONS')} "
+                   f"lockscreen={'on' if env('SET_LOCKSCREEN') == '1' else 'off'} "
                    f"applied={applied} -> {final.name}")
     if args.verbose:
-        print(f"gallery : {gallery}")
-        print(f"images  : {len(images)}")
-        print(f"xml     : {final}")
-        print(f"symlink : {link} -> {final.name}")
+        print(f"gallery     : {gallery}")
+        print(f"images      : {len(images)} (SR/letterbox substituted: {substituted})")
+        print(f"xml         : {final}")
+        print(f"symlink     : {link} -> {final.name}")
+        print(f"lock screen : {'on' if env('SET_LOCKSCREEN') == '1' else 'off'}")
     return 0
 
 

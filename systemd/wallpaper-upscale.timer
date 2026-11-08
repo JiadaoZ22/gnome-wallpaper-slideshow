@@ -1,0 +1,13 @@
+[Unit]
+Description=Daily re-scan for new sub-screen images to super-resolve
+
+[Timer]
+# New images arriving via sync are picked up daily; a manual/initial run is
+# started by install.sh. OnBootSec catches a first login before the daily slot.
+OnCalendar=*-*-* 04:05:00
+OnBootSec=30min
+Persistent=true
+Unit=wallpaper-upscale.service
+
+[Install]
+WantedBy=timers.target

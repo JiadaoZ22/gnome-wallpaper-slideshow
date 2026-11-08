@@ -1,6 +1,6 @@
 # gnome-wallpaper-slideshow user configuration
 # Installed to ~/.config/gnome-wallpaper-slideshow/config and read by the
-# systemd service (EnvironmentFile). Plain KEY=value, no `export`.
+# systemd services (EnvironmentFile). Plain KEY=value, no `export`.
 # Re-run `systemctl --user start wallpaper-slideshow.service` after editing.
 
 # Folder scanned for images (recursive). Temporary/partial downloads and
@@ -8,11 +8,16 @@
 GALLERY_DIR=/home/you/Documents/1_Gallery/b_Processed
 
 # How long each image stays, and the cross-fade duration, in seconds.
-DURATION=599.0
-TRANSITION=1.5
+DURATION=15.0
+TRANSITION=2.0
 
-# GNOME picture placement: zoom | centered | scaled | stretched | wallpaper | none
-PICTURE_OPTIONS=zoom
+# GNOME picture placement. 'scaled' = contain fit: the whole image is visible,
+# its aspect ratio is preserved (never stretched), and any unfilled area gets
+# black bars; nothing is cropped. Alternatives: zoom | centered | stretched | none
+PICTURE_OPTIONS=scaled
+
+# 1 = also set the same slideshow on the lock screen (org.gnome.desktop.screensaver)
+SET_LOCKSCREEN=1
 
 # 1 = reshuffle order on every regeneration; 0 = deterministic sorted order
 RANDOM=1
@@ -27,3 +32,18 @@ KEEP=5
 # than this many seconds (the daily timer still forces a rebuild). Set 0 to
 # disable. Override a single run with: make-slideshow --force
 DEBOUNCE=20
+
+# ---- Real-ESRGAN super-resolution (small images only) ----
+# Screen geometry; images below BOTH dimensions are enhanced so the contain
+# fit never enlarges a photo past its AI-upscaled size.
+SCREEN_W=3840
+SCREEN_H=2160
+# Quarantine (move to a dated *_lowres_quarantine_* sibling, never hard-delete)
+# any image whose width OR height is below this many pixels. Set 0 to disable.
+# Runs before every SR batch so ultra-low-res photos never reach the slideshow.
+MIN_DIMENSION=1080
+# Portable ncnn-Vulkan build; runs on the RTX 5090 D (gpu 0). realesrgan-x4plus
+# is the general-photo model bundled in the release.
+SR_MODEL=realesrgan-x4plus
+TILE_SIZE=400
+JPEG_QUALITY=92
