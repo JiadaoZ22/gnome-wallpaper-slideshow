@@ -263,6 +263,37 @@ var WallpaperEase = class WallpaperEase {
         return this._playlist.length ? this._playlist[this._index] : null;
     }
 
+    // Preload a texture through the SAME cache the shell uses (background.js).
+    // Meta.BackgroundImage has the 'loaded' signal and is_loaded(); raw
+    // Meta.Background only has 'changed', so we wait on the image, not the bg.
+    // Calls onReady exactly once, via load or a bounded timeout safety net.
+    _preload(path, onReady) {
+        let done = false;
+        const fire = () => {
+            if (done)
+                return;
+            done = true;
+            if (signalId)
+                image.disconnect(signalId);
+            if (timeoutId)
+                GLib.source_remove(timeoutId);
+            onReady();
+        };
+        const file = Gio.File.new_for_path(path);
+        const image = Meta.BackgroundImageCache.get_default().load(file);
+        let signalId = 0;
+        if (image.is_loaded()) {
+            fire();
+            return;
+        }
+        signalId = image.connect('loaded', fire);
+        // Safety net: never wedge the slideshow if 'loaded' is missed.
+        const timeoutId = this._addTimeout(4000, () => {
+            fire();
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
     _startFirst() {
         this._index = 0;
         const path = this._playlist[0];
@@ -274,18 +305,11 @@ var WallpaperEase = class WallpaperEase {
         const reveal = () => {
             if (!this._running)
                 return;
-            this._hideNative();          // only hide shell bg once we are painted
+            this._hideNative();          // only hide shell bg once texture is ready
             entry.actor.opacity = 255;
             this._scheduleNext();
         };
-        if (entry.background.isLoaded) {
-            reveal();
-        } else {
-            const loadedId = entry.background.connect('loaded', () => {
-                entry.background.disconnect(loadedId);
-                reveal();
-            });
-        }
+        this._preload(path, reveal);
     }
 
     _scheduleNext() {
@@ -363,27 +387,9 @@ var WallpaperEase = class WallpaperEase {
             });
         };
 
-        if (entry.background.isLoaded) {
-            beginFade();
-        } else {
-            let started = false;
-            const loadedId = entry.background.connect('loaded', () => {
-                if (started)
-                    return;
-                started = true;
-                entry.background.disconnect(loadedId);
-                beginFade();
-            });
-            // Bounded safety net if the 'loaded' signal is ever missed.
-            this._addTimeout(4000, () => {
-                if (!started && this._running) {
-                    started = true;
-                    try { entry.background.disconnect(loadedId); } catch (_e) {}
-                    beginFade();
-                }
-                return GLib.SOURCE_REMOVE;
-            });
-        }
+        // Wait until the new texture is decoded (Meta.BackgroundImage 'loaded'),
+        // never on the raw Meta.Background (which only emits 'changed').
+        this._preload(path, beginFade);
     }
 
     _finishFade(keep) {
