@@ -39,6 +39,27 @@ KEEP=5
 # disable. Override a single run with: make-slideshow --force
 DEBOUNCE=20
 
+# --- Screen-fitted wallpaper cache (anti-stutter) ---------------------------
+# Camera/source images are often 16-80 MP, far larger than a 4K panel's 8.3 MP.
+# GNOME Shell decodes each wallpaper on its render thread, so those oversized
+# files caused multi-hundred-ms frame stalls during the crossfade. Before each
+# playlist build, bin/downscale-wallpapers fits every image to the monitor's
+# long edge (no crop, no upscale) into the CACHE_DIR OUTSIDE the gallery and the
+# playlist points at those JPEGs. The originals in GALLERY_DIR are never touched.
+#
+# DOWNSCALE_ENABLED=1 refreshes the cache on every regeneration (incremental:
+# unchanged images are skipped). Set 0 to keep using whatever cache exists.
+DOWNSCALE_ENABLED=1
+# Output cache location and its manifest. Keep CACHE_DIR outside GALLERY_DIR so
+# the inotify watcher does not react to the cache's own writes.
+# CACHE_DIR=~/.local/share/backgrounds/wallpaper-cache
+# DOWNSCALE_MANIFEST=~/.local/state/gnome-wallpaper-slideshow/downscale-manifest.json
+# Target long edge in pixels. 0 = auto-detect the primary monitor (xrandr),
+# falling back to 3840 headless.
+# TARGET_LONG_EDGE=0
+# JPEG_QUALITY=88
+# MAX_WORKERS=0   # 0 = min(CPU count, 8) parallel encoders
+
 # NOTE: super-resolution and low-res pruning live in the separate
 # image-quality-toolkit repo. When installed, its wallpaper-upscale.service
 # reads this same file for GALLERY_DIR (and any SR_*/MIN_DIMENSION overrides you

@@ -29,6 +29,7 @@ GALLERY_DIR="${GALLERY_DIR:-$DEFAULT_GALLERY}"
 echo "==> Installing generator to $BIN_DIR"
 mkdir -p "$BIN_DIR"
 install -m 0755 "$SRC/bin/make-slideshow" "$BIN_DIR/make-slideshow"
+install -m 0755 "$SRC/bin/downscale-wallpapers" "$BIN_DIR/downscale-wallpapers"
 
 echo "==> Writing config to $CONFIG_DIR/config"
 mkdir -p "$CONFIG_DIR"

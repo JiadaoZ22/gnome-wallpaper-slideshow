@@ -1,6 +1,9 @@
 [Unit]
 Description=Watch gallery folder and regenerate the GNOME wallpaper slideshow on change
 After=graphical-session.target
+# Do not throttle burst triggers; the oneshot service coalesces via flock and
+# its own debounce. (TriggerLimitIntervalSec is only valid in [Unit], not [Path].)
+StartLimitIntervalSec=0
 
 [Path]
 # inotify watch (kernel-level, essentially free; no polling daemon).
@@ -9,8 +12,6 @@ After=graphical-session.target
 # Default gallery; install.sh rewrites this line if GALLERY_DIR is customized.
 PathModified=%h/Documents/1_Gallery/b_Processed
 Unit=wallpaper-slideshow.service
-# Do not throttle burst triggers; the oneshot service coalesces via flock.
-TriggerLimitIntervalSec=0
 
 [Install]
 WantedBy=graphical-session.target

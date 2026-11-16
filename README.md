@@ -45,6 +45,47 @@ timer entries, and one timeout inside the shell process.
   reach the screen, it is centered at its true enhanced size on a black canvas
   rather than being enlarged further.
 
+## Screen-fitted wallpaper cache (anti-stutter)
+
+Camera and phone originals are routinely **16–80 MP** — up to ~10× a 4K
+panel's 8.3 MP. GNOME Shell decodes each wallpaper and uploads it as a GL
+texture **on the compositor's main/render thread**, so rotating to an
+oversized original blocks that thread for hundreds of milliseconds and drops a
+dozen or more frames inside the crossfade (visible gliding/“卡卡的” jitter even
+though the hold time itself is smooth).
+
+`bin/downscale-wallpapers` removes that stall by fitting every image to the
+**primary monitor's long edge** before it ever reaches the shell:
+
+- contain-fit, **no crop and no upscale**; aspect preserved, black letterbox
+  unchanged. PNG/alpha and palette images flatten to RGB on black.
+- output is baseline JPEG written to
+  **`~/.local/share/backgrounds/wallpaper-cache/`** — deliberately **outside
+  the gallery**, so the source folder is never modified and the inotify watcher
+  cannot react to the cache's own writes. Originals are untouched.
+- **incremental**: a manifest (`downscale-manifest.json`, keyed by relative
+  path + size + mtime + target edge) skips unchanged images, so normal
+  regenerations re-encode nothing and finish in ~1 s. A monitor-resolution
+  change rebuilds automatically; pruned sources are garbage-collected.
+- multi-process (up to 8 workers); a full 1040-image 4K build takes ~35 s once.
+- fully **fail-soft**: if the tool is missing or errors, `make-slideshow`
+  transparently falls back to the original images, so the slideshow never breaks.
+
+`make-slideshow` calls it automatically before each build (`DOWNSCALE_ENABLED=1`)
+and resolves each image **downscale cache → optional SR manifest → original**.
+Measured on this machine (single-threaded decode, the render-thread cost):
+
+| | original | cache-fitted |
+|---|---|---|
+| mean decode | ~108 ms | ~41 ms (2.6× faster) |
+| worst-case decode | ~360 ms | ~63 ms (5.7× faster) |
+| dropped frames / rotation | ~6.5 | ~2.5 |
+
+Knobs (in the config file, all optional): `DOWNSCALE_ENABLED`, `CACHE_DIR`,
+`DOWNSCALE_MANIFEST`, `TARGET_LONG_EDGE` (0 = auto-detect via `xrandr`),
+`JPEG_QUALITY`, `MAX_WORKERS`. Run it standalone with
+`downscale-wallpapers --prepare-only`.
+
 ## Smooth iOS-style crossfade (the Wallpaper Ease extension)
 
 GNOME 42's **native** slideshow crossfade cannot do an iOS-style nonlinear
@@ -179,7 +220,9 @@ systemctl --user start wallpaper-slideshow.service
 
 `config` keys: `GALLERY_DIR`, `DURATION` (seconds per image), `TRANSITION`
 (cross-fade seconds), `PICTURE_OPTIONS`, `SET_LOCKSCREEN`, `RANDOM` (1/0),
-`EXTENSIONS`, `KEEP`, `DEBOUNCE`.
+`EXTENSIONS`, `KEEP`, `DEBOUNCE`, plus the optional screen-fitted cache knobs
+`DOWNSCALE_ENABLED`, `CACHE_DIR`, `DOWNSCALE_MANIFEST`, `TARGET_LONG_EDGE`,
+`JPEG_QUALITY`, `MAX_WORKERS` (see *Screen-fitted wallpaper cache*).
 
 ## Optional GPU super-resolution (image-quality-toolkit)
 
@@ -239,6 +282,7 @@ that repo's own uninstaller.
 
 ```
 bin/make-slideshow            oneshot slideshow + playlist/config generator
+bin/downscale-wallpapers      screen-fitted JPEG cache builder (anti-stutter)
 extension/<uuid>/             GNOME Shell extension: 60fps EASE_IN_OUT_CUBIC fade
   extension.js                  two Meta.Background actors; overview + switch sync
   metadata.json / stylesheet.css

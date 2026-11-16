@@ -14,8 +14,11 @@ Type=oneshot
 # Optional config; the leading "-" means "no error if the file is absent".
 # Overrides GALLERY_DIR / timings consumed by the generator script.
 EnvironmentFile=-%h/.config/gnome-wallpaper-slideshow/config
+# Refresh the screen-fitted wallpaper cache (fail-soft) and regenerate.
 ExecStart=%h/.local/bin/make-slideshow
 # A bulk download can emit hundreds of inotify events in seconds. oneshot
 # re-queues them; coalesce the burst with a short settle delay.
 ExecStartPre=/usr/bin/sleep 2
-TimeoutStartSec=120
+# A cold cache over a large gallery can take a few minutes on first build;
+# incremental runs finish in seconds. Give the oneshot real headroom.
+TimeoutStartSec=900

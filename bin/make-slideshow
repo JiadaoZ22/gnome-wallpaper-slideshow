@@ -27,6 +27,15 @@ DEFAULTS = {
     "OUTPUT_DIR": "~/.local/share/backgrounds/gnome-wallpaper-slideshow",
     "STATE_DIR": "~/.local/state/gnome-wallpaper-slideshow",
     "MANIFEST": "~/.local/state/gnome-wallpaper-slideshow/upscale-manifest.json",
+    # Screen-fitted cache (the anti-stutter path). Its manifest maps each
+    # gallery-relative source to a <=monitor-resolution JPEG OUTSIDE the
+    # gallery, so the shell never decodes a 16-80 MP camera original on its
+    # render thread. Built/refreshed by bin/downscale-wallpapers.
+    "DOWNSCALE_MANIFEST": "~/.local/state/gnome-wallpaper-slideshow/downscale-manifest.json",
+    "DOWNSCALE_BIN": "~/.local/bin/downscale-wallpapers",
+    # 1 = refresh the screen-fitted cache before each playlist build; 0 = use
+    # whatever cache/manifest already exists (no re-encode step in this run).
+    "DOWNSCALE_ENABLED": "1",
     "DURATION": "17.5",          # seconds each image stays up
     # Cross-fade seconds. NOTE on GNOME 42 the native slideshow (BGSlideShow)
     # crossfade is a LINEAR opacity blend redrawn at most once per second
@@ -201,6 +210,33 @@ def load_manifest(manifest_path: Path, gallery: Path, state_dir: Path) -> dict:
     return mapping
 
 
+def prepare_downscale_cache(gallery: Path, state_dir: Path) -> None:
+    """Refresh the screen-fitted wallpaper cache before building the playlist.
+
+    Fail-soft by design: the downscale tool is an optional performance layer.
+    If it is missing or errors, we log and continue on the original images, so
+    the slideshow never breaks because a re-encode step could not run.
+    """
+    if env("DOWNSCALE_ENABLED") != "1":
+        return
+    bin_path = Path(os.path.expanduser(env("DOWNSCALE_BIN")))
+    if not bin_path.exists():
+        log(state_dir, f"WARN downscale tool absent ({bin_path}); using originals")
+        return
+    try:
+        result = subprocess.run([str(bin_path), "--prepare-only"],
+                                capture_output=True, text=True, timeout=900)
+        # The tool always exits 0; surface its summary line and any stderr.
+        for line in (result.stdout.strip().splitlines() or [""]):
+            if line:
+                log(state_dir, line)
+        if result.returncode != 0:
+            log(state_dir, f"WARN downscale exited {result.returncode}: "
+                           f"{result.stderr.strip()[:300]}")
+    except Exception as e:
+        log(state_dir, f"WARN downscale step failed ({e}); using originals")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Generate and apply a GNOME wallpaper slideshow.")
     ap.add_argument("--no-apply", action="store_true",
@@ -248,13 +284,27 @@ def main() -> int:
         log(state_dir, f"WARN no usable images under {gallery}; keeping current wallpaper")
         return 0
 
-    # Substitute SR/letterbox-prepared paths for sub-screen images; every other
-    # photo keeps its original path (the manifest only contains small images).
+    # Refresh the screen-fitted cache (anti-stutter). Fail-soft: on any
+    # problem the loader below simply falls through to the original images.
+    prepare_downscale_cache(gallery, state_dir)
+
+    # Substitute prepared paths. Resolution priority per source image:
+    #   1. downscale cache (screen-fitted JPEG, the normal path)
+    #   2. SR/letterbox manifest from the optional image-quality-toolkit
+    #   3. the original gallery file
+    # Both maps are keyed by gallery-relative path and ignore missing targets.
+    downscale_map = load_manifest(
+        Path(os.path.expanduser(env("DOWNSCALE_MANIFEST"))), gallery, state_dir)
     mapping = load_manifest(manifest_path, gallery, state_dir)
     images = []
+    downscaled = 0
     substituted = 0
     for p in raw_images:
         rel = str(p.relative_to(gallery))
+        if rel in downscale_map:
+            images.append(downscale_map[rel])
+            downscaled += 1
+            continue
         prep = mapping.get(rel)
         if prep is not None:
             images.append(prep)
@@ -312,13 +362,13 @@ def main() -> int:
             ok = gsettings_set("org.gnome.desktop.screensaver", "picture-options", style, state_dir) and ok
         applied = "yes" if ok else "xml-only"
 
-    log(state_dir, f"OK images={len(images)} sr_substituted={substituted} "
+    log(state_dir, f"OK images={len(images)} downscaled={downscaled} sr_substituted={substituted} "
                    f"duration={duration:.1f}s transition={transition:.1f}s style={env('PICTURE_OPTIONS')} "
                    f"lockscreen={'on' if env('SET_LOCKSCREEN') == '1' else 'off'} "
                    f"applied={applied} -> {final.name}; playlist={playlist_path.name}")
     if args.verbose:
         print(f"gallery     : {gallery}")
-        print(f"images      : {len(images)} (SR/letterbox substituted: {substituted})")
+        print(f"images      : {len(images)} (downscale cache: {downscaled}, SR/letterbox substituted: {substituted})")
         print(f"xml         : {final}")
         print(f"playlist    : {playlist_path} ({len(images)} entries)")
         print(f"ext config  : {ext_cfg_path}")

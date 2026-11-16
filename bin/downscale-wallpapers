@@ -1,0 +1,293 @@
+#!/usr/bin/env python3
+"""Downscale gallery photos to screen-fitted wallpaper JPEGs.
+
+Why this exists
+---------------
+GNOME Shell's Meta.Background path decodes each wallpaper and uploads it as a
+GL texture on the shell's main/render thread. Camera/source images in the
+gallery are routinely 16-80 MP (up to ~10x a 4K panel's 8.3 MP), so every
+rotation blocked the compositor for hundreds of milliseconds, dropping a dozen
+or more frames during the ease crossfade (visible "gliding"/stutter). Pre-fit
+images decode in a few milliseconds instead, removing that stall while keeping
+full on-screen quality (a monitor cannot show more pixels than it has).
+
+Design
+------
+* ONESHOT, stdlib + Pillow only. Safe to re-run: incremental via a manifest
+  keyed by source relative path + size + mtime, so unchanged images are never
+  re-encoded. Intended to be called by make-slideshow before each playlist
+  build, and usable standalone (`downscale-wallpapers --prepare-only`).
+* The cache lives OUTSIDE the gallery (default
+  ~/.local/share/backgrounds/wallpaper-cache), so the source folder is never
+  modified and the systemd path watcher on the gallery does not self-trigger.
+* Contain-fit to the primary monitor's resolution (never crop, never upscale),
+  aspect preserved. Output is baseline JPEG (fast, universal decode); the
+  letterbox fill is black to match GDesktopEnums SCALED.
+* Orphaned cache files whose source was pruned are removed.
+
+The companion manifest maps gallery-relative source path -> prepared absolute
+path, exactly the contract make-slideshow already consumes.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+import sys
+import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from pathlib import Path
+
+from PIL import Image, ImageOps
+
+DEFAULTS = {
+    "GALLERY_DIR": "~/Documents/1_Gallery/b_Processed",
+    "CACHE_DIR": "~/.local/share/backgrounds/wallpaper-cache",
+    "STATE_DIR": "~/.local/state/gnome-wallpaper-slideshow",
+    "DOWNSCALE_MANIFEST": "~/.local/state/gnome-wallpaper-slideshow/downscale-manifest.json",
+    # Target long-edge ceiling. Auto-detected from the primary monitor when 0;
+    # falls back to 3840 (4K UHD) when no monitor is reachable (headless run).
+    "TARGET_LONG_EDGE": "0",
+    "JPEG_QUALITY": "88",
+    "EXTENSIONS": "jpg,jpeg,png,webp,bmp,gif",
+    "MAX_WORKERS": "0",   # 0 = min(cpu, 8)
+}
+EXCLUDE_SUFFIXES = (
+    ".aliyunpan-downloading", ".part", ".tmp", ".download", ".crdownload", "~",
+)
+# Source smaller than this fraction of the target is copied through untouched
+# (upscaling cannot add detail and only costs decode time on the shell).
+MIN_FIT_FRACTION = 0.62
+
+
+def env(key: str) -> str:
+    val = os.environ.get(key)
+    return val if val not in (None, "") else os.path.expanduser(DEFAULTS[key])
+
+
+def log_line(msg: str) -> None:
+    print(f"{dt.datetime.now().isoformat(timespec='seconds')} {msg}", flush=True)
+
+
+def detect_long_edge(fallback: int) -> int:
+    """Best-effort primary-monitor long edge without requiring a display lib."""
+    # 1) Explicit override always wins.
+    override = env("TARGET_LONG_EDGE")
+    if override.isdigit() and int(override) > 0:
+        return int(override)
+    # 2) xrandr (X11, the session this machine runs).
+    if os.environ.get("DISPLAY"):
+        try:
+            import subprocess
+            out = subprocess.run(["xrandr"], capture_output=True, text=True,
+                                 timeout=10).stdout
+            best = 0
+            for line in out.splitlines():
+                if " connected" not in line:
+                    continue
+                # current resolution is reported as "current W x H"
+                if "current" in line:
+                    seg = line.split("current", 1)[1]
+                    nums = [int(tok) for tok in
+                            "".join(c if c.isdigit() else " " for c in seg).split()]
+                    if len(nums) >= 2:
+                        best = max(best, nums[0], nums[1])
+            if best:
+                return best
+        except Exception:
+            pass
+    return fallback
+
+
+def collect_sources(gallery: Path, extensions: set[str]) -> list[Path]:
+    out = []
+    for root, _dirs, files in os.walk(gallery):
+        for name in files:
+            if name.startswith("."):
+                continue
+            lower = name.lower()
+            if lower.endswith(EXCLUDE_SUFFIXES):
+                continue
+            if lower.rsplit(".", 1)[-1] not in extensions:
+                continue
+            out.append(Path(root) / name)
+    return sorted(out)
+
+
+def _process_one(args_tuple) -> tuple[str, dict | None, str | None]:
+    """Worker: encode one image. Runs in a child process (CPU-bound decode)."""
+    src_str, rel, cache_dir_str, long_edge, quality = args_tuple
+    src = Path(src_str)
+    cache_dir = Path(cache_dir_str)
+    try:
+        st = src.stat()
+        with Image.open(src) as im:
+            ImageOps.exif_transpose(im, in_place=True)
+            w, h = im.size
+            scale = long_edge / max(w, h)
+            needs_scale = max(w, h) > long_edge
+            # Flat-name by relative path keeps the mapping human-debuggable and
+            # avoids collisions across subfolders.
+            flat = rel.replace(os.sep, "__")
+            stem = os.path.splitext(flat)[0]
+            out_path = cache_dir / f"{stem}.jpg"
+
+            if needs_scale:
+                new_size = (max(1, round(w * scale)), max(1, round(h * scale)))
+                im = im.resize(new_size, Image.LANCZOS)
+            # JPEG has no alpha; composite onto black (the letterbox base color).
+            if im.mode in ("RGBA", "LA", "P"):
+                bg = Image.new("RGB", im.size, (0, 0, 0))
+                rgba = im.convert("RGBA")
+                bg.paste(rgba, mask=rgba.split()[-1])
+                im = bg
+            elif im.mode != "RGB":
+                im = im.convert("RGB")
+
+            # Unique, stable cache name: a short hash of the gallery-relative
+            # path disambiguates same-basename files in different subfolders,
+            # while the human-readable stem keeps the cache greppable.
+            safe_stem = os.path.splitext(flat)[0][:60].replace(os.sep, "_")
+            digest = hashlib.sha1(rel.encode("utf-8")).hexdigest()[:10]
+            out_path = cache_dir / f"{safe_stem}.{digest}.jpg"
+            tmp = out_path.with_suffix(".jpg.tmp")
+            im.save(tmp, format="JPEG", quality=quality, optimize=False,
+                    progressive=False, subsampling=2)
+            os.replace(tmp, out_path)
+        rec = {
+            "prepared": str(out_path),
+            "source": str(src),
+            "source_size": st.st_size,
+            "source_mtime": int(st.st_mtime),
+            "source_dims": [w, h],
+            "prepared_dims": list(im.size),
+            "long_edge": long_edge,
+            "scaled": needs_scale,
+        }
+        return rel, rec, None
+    except Exception as exc:  # never let one bad image abort the batch
+        return rel, None, f"{type(exc).__name__}: {exc}"
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Build a screen-fitted wallpaper cache.")
+    ap.add_argument("--prepare-only", action="store_true",
+                    help="build/refresh the cache and manifest, then exit")
+    ap.add_argument("--verbose", action="store_true")
+    args = ap.parse_args()
+
+    gallery = Path(os.path.expanduser(env("GALLERY_DIR")))
+    cache_dir = Path(os.path.expanduser(env("CACHE_DIR")))
+    state_dir = Path(os.path.expanduser(env("STATE_DIR")))
+    manifest_path = Path(os.path.expanduser(env("DOWNSCALE_MANIFEST")))
+    quality = int(env("JPEG_QUALITY"))
+    long_edge = detect_long_edge(fallback=3840)
+    workers = int(env("MAX_WORKERS")) or min(os.cpu_count() or 2, 8)
+
+    if not gallery.is_dir():
+        log_line(f"ERROR gallery not found: {gallery}")
+        return 1
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    state_dir.mkdir(parents=True, exist_ok=True)
+
+    extensions = {e.strip().lower() for e in env("EXTENSIONS").split(",") if e.strip()}
+    sources = collect_sources(gallery, extensions)
+    if not sources:
+        log_line(f"WARN no images under {gallery}")
+        return 0
+
+    prior: dict = {}
+    if manifest_path.exists():
+        try:
+            prior = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if not isinstance(prior, dict):
+                prior = {}
+        except Exception:
+            prior = {}
+
+    cached: dict = {}     # rel -> manifest record, carried forward unchanged
+    work: list[tuple] = []  # process-pool argument tuples for images to (re)encode
+    for src in sources:
+        rel = str(src.relative_to(gallery))
+        st = src.stat()
+        prev = prior.get(rel)
+        # Incremental: skip when source unchanged, target exists, and it was
+        # fitted for the same long edge (a monitor resolution change rebuilds).
+        if (isinstance(prev, dict) and prev.get("source_mtime") == int(st.st_mtime)
+                and prev.get("source_size") == st.st_size
+                and prev.get("long_edge") == long_edge
+                and Path(prev.get("prepared", "")).exists()):
+            cached[rel] = prev
+            continue
+        work.append((str(src), rel, str(cache_dir), long_edge, quality))
+
+    t0 = time.perf_counter()
+    manifest: dict = dict(cached)
+    reused = len(cached)
+    failed: list[str] = []
+    done = 0
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        futs = {pool.submit(_process_one, job): job[1] for job in work}
+        for fut in as_completed(futs):
+            rel, rec, err = fut.result()
+            done += 1
+            if rec is not None:
+                manifest[rel] = rec
+            else:
+                failed.append(f"{rel}: {err}")
+                # Fall back to the previous cache entry if it still exists.
+                if rel in prior and Path(prior[rel].get("prepared", "")).exists():
+                    manifest[rel] = prior[rel]
+            if args.verbose and done % 50 == 0:
+                log_line(f"  ...{done}/{len(work)} encoded")
+
+    # Prune orphaned cache files (source removed).
+    live_files = {rec["prepared"] for rec in manifest.values()}
+    pruned = 0
+    for f in cache_dir.glob("*.jpg"):
+        if str(f) not in live_files:
+            try:
+                f.unlink()
+                pruned += 1
+            except OSError:
+                pass
+
+    # Atomic manifest publish.
+    payload = {
+        "_meta": {
+            "generated": dt.datetime.now().isoformat(timespec="seconds"),
+            "gallery": str(gallery),
+            "cache_dir": str(cache_dir),
+            "long_edge": long_edge,
+            "jpeg_quality": quality,
+            "total_sources": len(sources),
+            "cached": len(manifest),
+            "encoded_this_run": done,
+            "reused": reused,
+            "failed": len(failed),
+            "pruned": pruned,
+            "elapsed_sec": round(time.perf_counter() - t0, 1),
+        },
+    }
+    payload.update(manifest)
+    tmp = manifest_path.with_name(f".{manifest_path.name}.tmp")
+    tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    os.replace(tmp, manifest_path)
+
+    log_line(
+        f"DOWNSCALE long_edge={long_edge} sources={len(sources)} cached={len(manifest)} "
+        f"encoded={done} reused={reused} failed={len(failed)} pruned={pruned} "
+        f"in {time.perf_counter() - t0:.1f}s -> {manifest_path.name}"
+    )
+    for e in failed[:10]:
+        log_line(f"  FAIL {e}")
+    if args.prepare_only:
+        return 0
+    # Non-fatal: make-slideshow treats a thin manifest as "use originals".
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

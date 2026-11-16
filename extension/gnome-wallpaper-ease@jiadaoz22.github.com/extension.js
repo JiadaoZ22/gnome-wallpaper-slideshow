@@ -523,8 +523,11 @@ var WallpaperEase = class WallpaperEase {
             return;
         }
         signalId = image.connect('loaded', fire);
-        // Safety net: never wedge the slideshow if 'loaded' is missed.
-        const timeoutId = this._addTimeout(4000, () => {
+        // Safety net: never wedge the slideshow if 'loaded' is missed. Generous
+        // because a cold multi-MP image under disk/CPU contention can take well
+        // over 4 s; the normal path still fires on 'loaded' immediately, so this
+        // only bounds the worst case rather than pacing every rotation.
+        const timeoutId = this._addTimeout(12000, () => {
             fire();
             return GLib.SOURCE_REMOVE;
         });

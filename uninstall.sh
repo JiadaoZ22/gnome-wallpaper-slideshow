@@ -58,13 +58,17 @@ else
 fi
 
 if [ "${1:-}" = "--purge" ]; then
-  echo "==> Purging config, generator, logs and generated XML"
+  echo "==> Purging config, generator, logs, generated XML and screen-fitted cache"
   rm -f "$HOME/.local/bin/make-slideshow"
+  rm -f "$HOME/.local/bin/downscale-wallpapers"
   rm -rf "$HOME/.config/gnome-wallpaper-slideshow"
   rm -rf "$HOME/.local/state/gnome-wallpaper-slideshow"
   rm -rf "$HOME/.local/share/backgrounds/gnome-wallpaper-slideshow"
-  echo "    purged (image-quality-toolkit and its SR cache are left intact)"
+  # Screen-fitted wallpaper cache and its manifest live outside the gallery;
+  # safe to delete because the tool rebuilds them from the source images.
+  rm -rf "$HOME/.local/share/backgrounds/wallpaper-cache"
+  echo "    purged (gallery originals and image-quality-toolkit are left intact)"
 else
-  echo "==> Kept config/XML (use '$0 --purge' to remove them too)"
+  echo "==> Kept config/XML/cache (use '$0 --purge' to remove them too)"
 fi
 echo "Uninstall complete."
