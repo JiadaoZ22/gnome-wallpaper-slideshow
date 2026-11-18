@@ -124,7 +124,9 @@ def _process_one(args_tuple) -> tuple[str, dict | None, str | None]:
     try:
         st = src.stat()
         with Image.open(src) as im:
-            ImageOps.exif_transpose(im, in_place=True)
+            # Pillow <10.1 has no in_place kwarg (returns a new image or None);
+            # reassigning the return value is correct on every version.
+            im = ImageOps.exif_transpose(im) or im
             w, h = im.size
             scale = long_edge / max(w, h)
             needs_scale = max(w, h) > long_edge
