@@ -26,6 +26,7 @@
 const { Clutter, GDesktopEnums, Gio, GLib, Meta } = imports.gi;
 const ByteArray = imports.byteArray;
 const Main = imports.ui.main;
+const { MonitorConstraint } = imports.ui.layout;
 
 const DEFAULT_PLAYLIST = GLib.build_filenamev(
     [GLib.get_user_data_dir(), 'backgrounds', 'gnome-wallpaper-slideshow', 'playlist.json']);
@@ -134,10 +135,27 @@ var WallpaperEase = class WallpaperEase {
     }
 
     // ---- timeout bookkeeping (all removed on disable) ----
-    _addTimeout(millis, callback) {
+    // Every callback is wrapped so an uncaught exception can never permanently
+    // kill the rotation chain. In GJS, an exception escaping a GLib.timeout_add
+    // callback removes that source; because each rotation re-arms the next from
+    // inside the previous callback, one throw would freeze the slideshow. The
+    // wrapper logs and still re-arms via the onError hook when provided.
+    _addTimeout(millis, callback, onError) {
         const id = GLib.timeout_add(GLib.PRIORITY_DEFAULT, millis, () => {
             this._timeouts.delete(id);
-            return callback();
+            try {
+                return callback();
+            } catch (e) {
+                logError(e, 'wallpaper-ease: timeout callback failed');
+                if (onError) {
+                    try {
+                        onError(e);
+                    } catch (e2) {
+                        logError(e2, 'wallpaper-ease: timeout recovery failed');
+                    }
+                }
+                return GLib.SOURCE_REMOVE;
+            }
         });
         this._timeouts.add(id);
         return id;
@@ -505,6 +523,14 @@ var WallpaperEase = class WallpaperEase {
     // Calls onReady exactly once, via load or a bounded timeout safety net.
     _preload(path, onReady) {
         let done = false;
+        let signalId = 0;
+        // Declared up front (not after the is_loaded() fast path) so that the
+        // synchronous fire() below can reference it. Previously this was a
+        // `const` initialized only on the slow path, so a warm-cache image —
+        // image.is_loaded() === true — threw a temporal-dead-zone
+        // ReferenceError inside the rotation timeout, which GJS used to remove
+        // the source and freeze the whole slideshow.
+        let timeoutId = 0;
         const fire = () => {
             if (done)
                 return;
@@ -517,7 +543,6 @@ var WallpaperEase = class WallpaperEase {
         };
         const file = Gio.File.new_for_path(path);
         const image = Meta.BackgroundImageCache.get_default().load(file);
-        let signalId = 0;
         if (image.is_loaded()) {
             fire();
             return;
@@ -527,7 +552,7 @@ var WallpaperEase = class WallpaperEase {
         // because a cold multi-MP image under disk/CPU contention can take well
         // over 4 s; the normal path still fires on 'loaded' immediately, so this
         // only bounds the worst case rather than pacing every rotation.
-        const timeoutId = this._addTimeout(12000, () => {
+        timeoutId = this._addTimeout(12000, () => {
             fire();
             return GLib.SOURCE_REMOVE;
         });
@@ -557,6 +582,11 @@ var WallpaperEase = class WallpaperEase {
         this._addTimeout(this._cfg.intervalMs, () => {
             this._advance();
             return GLib.SOURCE_REMOVE;
+        }, () => {
+            // Defensive: if an advance throws, re-arm so the deck keeps turning
+            // instead of freezing on the current frame.
+            if (this._running && this._playlist.length > 1)
+                this._scheduleNext();
         });
     }
 
@@ -592,8 +622,13 @@ var WallpaperEase = class WallpaperEase {
             meta_display: global.display,
             monitor: this._monitorIndex,
             request_mode: Clutter.RequestMode.CONTENT_SIZE,
-            x_expand: true,
-            y_expand: true,
+            // Match the shell's native BackgroundManager (background.js):
+            // CONTENT_SIZE actors use x/y_expand = FALSE. With expand true and
+            // only a fixed position, the actor's allocation could drift from
+            // the monitor rect under HiDPI (scale-monitor-framebuffer), which
+            // shifted the letterboxed image up-left and clipped its top frame.
+            x_expand: false,
+            y_expand: false,
         });
         actor.content.set({
             background,
@@ -601,6 +636,11 @@ var WallpaperEase = class WallpaperEase {
             vignette_sharpness: 0.5,
             brightness: 0.5,
         });
+        // Canonical geometry pin: force the actor's allocation to exactly this
+        // monitor's rect (x, y, width, height) on every relayout, the same
+        // constraint the shell uses for its own full-monitor actors. This is
+        // what guarantees SCALED letterboxing is centered with no top crop.
+        actor.add_constraint(new MonitorConstraint({ index: this._monitorIndex }));
         actor.set_position(monitor.x, monitor.y);
         actor.opacity = 0;
         actor[MINE_PROP] = true;
