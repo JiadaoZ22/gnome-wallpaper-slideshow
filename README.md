@@ -38,6 +38,14 @@ timer entries, and one timeout inside the shell process.
   is visible, its **aspect ratio is always preserved** (never stretched), and
   any unfilled area is black. Vertical and ultrawide photos get side/top bars;
   nothing is cropped (unlike `zoom`).
+- **The top edge is covered by the GNOME panel, not cropped.** The wallpaper
+  actor fills the whole monitor and starts at y = 0; the opaque top panel (27
+  logical / 54 physical px on a 4K scale-2 panel) is painted *above* it, so a
+  height-filling portrait runs underneath the bar. This matches stock GNOME's
+  own background exactly. The contain-fit math, the two rendering/freezing bugs
+  that were fixed to reach this behavior, and how to verify a screenshot are
+  documented in
+  [`docs/wallpaper-geometry-and-top-panel.md`](docs/wallpaper-geometry-and-top-panel.md).
 - **Never upscale past the enhanced size.** Images at/above the screen in one
   dimension are only downscaled. If the optional image-quality-toolkit is
   installed, images smaller than the screen in **both** dimensions are
@@ -295,6 +303,9 @@ systemd/
   wallpaper-slideshow.path    inotify watcher on the gallery
   wallpaper-slideshow.timer   daily/boot backstop
 install.sh / uninstall.sh     user-level (no root except optional linger)
+docs/
+  wallpaper-geometry-and-top-panel.md   contain-fit math, top-panel overlap vs.
+                                        crop, the two fixed bugs, reload/verify notes
 ```
 
 The `wallpaper-upscale.{service,timer}` units and the `upscale-wallpapers` /
@@ -331,6 +342,19 @@ groups (`global.window_manager` `switch-workspace`) to the current image. If a
 mismatch returns, confirm the extension is `ENABLED` and was reloaded after the
 last `extension.js` edit, then check `journalctl --user -b | grep wallpaper-ease`
 for a retarget error.
+
+### Top of a portrait looks cut off, or the slideshow freezes on one image
+
+The top edge being hidden is almost always the **opaque GNOME top panel
+overlaying the wallpaper**, not a crop — stock GNOME behaves the same. A real
+up-left letterbox shift (the historical `x/y_expand: true` HiDPI bug) and the
+warm-cache TDZ `ReferenceError` that permanently stopped the rotation timer
+were both fixed in `extension.js`. For the contain-fit math, how to prove
+panel-overlap vs. crop from a screenshot, the GJS module-caching/reload gotchas
+(why `disable/enable` alone never picks up an edit; why an unchanged PID does
+not mean the shell failed to restart on X11), and window-occlusion measurement
+traps, see
+[**docs/wallpaper-geometry-and-top-panel.md**](docs/wallpaper-geometry-and-top-panel.md).
 
 ## Limitations
 

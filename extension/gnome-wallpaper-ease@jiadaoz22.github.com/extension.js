@@ -26,7 +26,6 @@
 const { Clutter, GDesktopEnums, Gio, GLib, Meta } = imports.gi;
 const ByteArray = imports.byteArray;
 const Main = imports.ui.main;
-const { MonitorConstraint } = imports.ui.layout;
 
 const DEFAULT_PLAYLIST = GLib.build_filenamev(
     [GLib.get_user_data_dir(), 'backgrounds', 'gnome-wallpaper-slideshow', 'playlist.json']);
@@ -621,12 +620,14 @@ var WallpaperEase = class WallpaperEase {
         const actor = new Meta.BackgroundActor({
             meta_display: global.display,
             monitor: this._monitorIndex,
+            // Mirror the shell's native BackgroundManager._createBackgroundActor()
+            // exactly: a CONTENT_SIZE actor whose ClutterContent preferred size is
+            // the full monitor rect (see meta_background_content_get_preferred_size),
+            // with x/y_expand FALSE so it is never re-sized away from that rect.
+            // That combination letterboxes SCALED images centered with no crop, even
+            // under HiDPI scale-monitor-framebuffer. The earlier x/y_expand TRUE let
+            // the FixedLayout drift the allocation up-left and clip the top frame.
             request_mode: Clutter.RequestMode.CONTENT_SIZE,
-            // Match the shell's native BackgroundManager (background.js):
-            // CONTENT_SIZE actors use x/y_expand = FALSE. With expand true and
-            // only a fixed position, the actor's allocation could drift from
-            // the monitor rect under HiDPI (scale-monitor-framebuffer), which
-            // shifted the letterboxed image up-left and clipped its top frame.
             x_expand: false,
             y_expand: false,
         });
@@ -636,11 +637,11 @@ var WallpaperEase = class WallpaperEase {
             vignette_sharpness: 0.5,
             brightness: 0.5,
         });
-        // Canonical geometry pin: force the actor's allocation to exactly this
-        // monitor's rect (x, y, width, height) on every relayout, the same
-        // constraint the shell uses for its own full-monitor actors. This is
-        // what guarantees SCALED letterboxing is centered with no top crop.
-        actor.add_constraint(new MonitorConstraint({ index: this._monitorIndex }));
+        // Native BackgroundManager positions its CONTENT_SIZE background actor with
+        // a plain set_position(monitor.x, monitor.y); the content's preferred size
+        // supplies the full-monitor width/height. No MonitorConstraint: the native
+        // desktop background uses none, and adding one in this FixedLayout group is
+        // unproven. Keep this byte-for-byte equivalent to the working native path.
         actor.set_position(monitor.x, monitor.y);
         actor.opacity = 0;
         actor[MINE_PROP] = true;
